@@ -1,0 +1,56 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.pytype/
+.cache/
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.sublime-project
+*.sublime-workspace
+
+# Experiment artifacts
+wandb/
+logs/
+run_logs/
+models/
+checkpoints/
+dppo/log/
+dppo/checkpoints/
+
+# Large binary artifacts
+*.pt
+*.pth
+*.ckpt
+*.npz
+*.pkl
+*.hdf5
+*.h5
+*.wandb
+*.mp4
+*.avi
+
+# Local secrets
+.env
+.env.*
+keys/
+*.pem
+*.key
+.netrc
+
+# Build artifacts
+build/
+dist/
+htmlcov/
+.coverage
+.coverage.*
+
+MUJOCO_LOG.TXT
+
