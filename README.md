@@ -110,6 +110,61 @@ The script writes W&B logs online by default. To disable W&B sync:
 WANDB_MODE=offline bash scripts/launch_budget_strong_chunk_ablation.sh can elastic 0 0 dsrl stable_v2
 ```
 
+## Elastic Soft-Prior Sweep
+
+These scripts run elastic-only soft-prior experiments.
+
+Preview without starting training:
+
+```bash
+DRY_RUN=1 scripts/run_elastic_softprior_sweep.sh 8 6,7 dsrl
+DRY_RUN=1 scripts/run_elastic_softprior_sweep.sh 16 6,7 dsrl
+```
+
+Start training:
+
+```bash
+RUN_TAG=softprior_v1 scripts/run_elastic_softprior_sweep.sh 8 6,7 dsrl
+RUN_TAG=softprior_v1 scripts/run_elastic_softprior_sweep.sh 16 6,7 dsrl
+```
+
+Plans:
+
+```text
+8 runs:  can/square x seed0/1 x soft_h2_bal/soft_h3_safe
+16 runs: can/square x seed0/1 x soft_h2_bal/soft_h2_res/soft_h3_safe/soft_h2_edge
+```
+
+Monitor:
+
+```bash
+tmux ls | grep dsrl_diff_elastic
+tmux attach -t dsrl_diff_elastic_p8_g6_softprior_v1
+```
+
+Detach from tmux without stopping training: `Ctrl-b`, then `d`.
+
+Logs:
+
+```bash
+ls run_logs/*softprior_v1*
+tail -f run_logs/softprior_v1_can_elastic_soft_h2_bal_seed0_gpu6.log
+```
+
+Run one job manually:
+
+```bash
+scripts/launch_elastic_softprior.sh can 6 0 dsrl soft_h2_bal
+```
+
+Format:
+
+```text
+scripts/launch_elastic_softprior.sh TASK GPU SEED CONDA_ENV VARIANT
+```
+
+Variants: `soft_h2_bal`, `soft_h2_res`, `soft_h3_safe`, `soft_h2_edge`.
+
 ## Important Files
 
 ```text
