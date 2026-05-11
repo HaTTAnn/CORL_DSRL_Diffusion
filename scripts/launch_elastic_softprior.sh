@@ -1,11 +1,33 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-TASK="${1:?usage: launch_elastic_softprior.sh TASK GPU SEED [CONDA_ENV] [VARIANT]}"
+TASK="${1:?usage: launch_elastic_softprior.sh TASK GPU SEED [ENV_LABEL] [VARIANT]}"
 GPU="${2:-7}"
 SEED="${3:-1}"
-CONDA_ENV="${4:-${CONDA_ENV:-dsrl}}"
+ENV_LABEL="${4:-${ENV_LABEL:-uv}}"
 VARIANT="${5:-soft_h2_bal}"
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd -P)"
+DEVICE="${DEVICE:-cuda:0}"
+RUN_START_TS="$(date '+%F %T')"
+SECONDS=0
+
+format_seconds() {
+  local s="$1"
+  printf "%02d:%02d:%02d" "$((s / 3600))" "$(((s % 3600) / 60))" "$((s % 60))"
+}
+
+on_exit() {
+  local code="$?"
+  local elapsed="$SECONDS"
+  echo ""
+  echo "[timer] started:  $RUN_START_TS"
+  echo "[timer] finished: $(date '+%F %T')"
+  echo "[timer] elapsed:  $(format_seconds "$elapsed")"
+  echo "[timer] exit code: $code"
+}
+trap on_exit EXIT
 
 N_EVAL_ENVS="${N_EVAL_ENVS:-5}"
 NUM_EVALS="${NUM_EVALS:-10}"
@@ -115,9 +137,20 @@ case "$VARIANT" in
     ;;
 esac
 
-cd /root/storage/CODE/txy/dsrl_fv
-source /root/miniconda/etc/profile.d/conda.sh
-conda activate "$CONDA_ENV"
+cd "$PROJECT_ROOT"
+
+if [[ -n "${VIRTUAL_ENV:-}" ]]; then
+  echo "Using active virtualenv: $VIRTUAL_ENV"
+elif [[ -f "$PROJECT_ROOT/.venv/bin/activate" ]]; then
+  source "$PROJECT_ROOT/.venv/bin/activate"
+  echo "Activated uv virtualenv: $PROJECT_ROOT/.venv"
+else
+  echo "No active virtualenv and no $PROJECT_ROOT/.venv found." >&2
+  echo "Run from project root:" >&2
+  echo "  uv venv .venv --python 3.10" >&2
+  echo "  source .venv/bin/activate" >&2
+  exit 1
+fi
 
 export CUDA_VISIBLE_DEVICES="$GPU"
 export MUJOCO_GL="${MUJOCO_GL:-egl}"
@@ -125,17 +158,20 @@ export PYTHONUNBUFFERED=1
 export HYDRA_FULL_ERROR=1
 export WANDB__SERVICE_WAIT=300
 export WANDB_MODE="${WANDB_MODE:-online}"
+export PYTHONPATH="$PROJECT_ROOT:$PROJECT_ROOT/dppo:$PROJECT_ROOT/stable-baselines3:${PYTHONPATH:-}"
 
 GROUP="${WANDB_GROUP_PREFIX}_${TASK}_${VARIANT}_${RUN_TAG}"
-RUN_NAME="${TASK}_elastic_${VARIANT}_seed${SEED}_${CONDA_ENV}_${RUN_TAG}"
+RUN_NAME="${TASK}_elastic_${VARIANT}_seed${SEED}_${ENV_LABEL}_${RUN_TAG}"
 
+echo "project root: $PROJECT_ROOT"
+echo "python: $(which python)"
 echo "run=${RUN_NAME} gpu=${GPU} task=${TASK} seed=${SEED} variant=${VARIANT}"
 echo "soft-prior: scale=${DIFFICULTY_PRIOR_SCALE}, hard_steps=${DIFFICULTY_HARD_STEPS_TARGET}, hard_chunk=${DIFFICULTY_HARD_CHUNK_TARGET}, easy_steps=${DIFFICULTY_EASY_STEPS_TARGET}, easy_chunk=${DIFFICULTY_EASY_CHUNK_TARGET}, preprior=${PREPRIOR_RESIDUAL_SCALE}, residual=${SCHEDULE_RESIDUAL_SCALE}"
 echo "cost: band=[${NFE_TARGET_LOWER},${NFE_TARGET_UPPER}], lambda=${ACTOR_COMPUTE_LAMBDA_WARMUP}->${ACTOR_COMPUTE_LAMBDA}, debt=${NFE_DEBT_LIMIT}, saving=${NFE_SAVING_WEIGHT}"
 
 python train_dsrl.py --config-name "dsrl_${TASK}.yaml" \
   seed="$SEED" \
-  device=cuda:0 \
+  device="$DEVICE" \
   name="$RUN_NAME" \
   wandb.project="$WANDB_PROJECT" \
   wandb.group="$GROUP" \
@@ -220,4 +256,3 @@ python train_dsrl.py --config-name "dsrl_${TASK}.yaml" \
   ++train.eval_success_ema_beta=0.8 \
   ++train.range_success_ema_beta="$RANGE_SUCCESS_EMA_BETA" \
   ++train.difficulty_success_ema_beta="$DIFFICULTY_SUCCESS_EMA_BETA"
-

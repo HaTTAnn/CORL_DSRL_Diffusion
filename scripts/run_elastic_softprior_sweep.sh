@@ -1,12 +1,16 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-PLAN="${1:-8}"
-GPUS_CSV="${2:-${GPUS:-6,7}}"
-CONDA_ENV="${3:-${CONDA_ENV:-dsrl}}"
-REPO="/root/storage/CODE/txy/dsrl_fv"
+PLAN="${1:-16}"
+GPUS_CSV="${2:-${GPUS:-0,1,2,3,4,5,6,7}}"
+ENV_LABEL="${3:-${ENV_LABEL:-uv}}"
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd -P)"
 RUN_TAG="${RUN_TAG:-$(date +%Y_%m_%d_%H_%M_%S)}"
 DRY_RUN="${DRY_RUN:-0}"
+WANDB_GROUP_PREFIX="${WANDB_GROUP_PREFIX:-elastic_softprior_p${PLAN}}"
+LOG_DIR="${LOG_DIR:-$PROJECT_ROOT/run_logs}"
 
 IFS=',' read -r -a GPUS <<< "$GPUS_CSV"
 if [[ "${#GPUS[@]}" -lt 1 ]]; then
@@ -26,13 +30,13 @@ case "$PLAN" in
     VARIANTS=(soft_h2_bal soft_h2_res soft_h3_safe soft_h2_edge)
     ;;
   *)
-    echo "usage: $0 [8|16] [gpu_csv] [conda_env]" >&2
-    echo "example: DRY_RUN=1 $0 16 6,7 dsrl" >&2
+    echo "usage: $0 [8|16] [gpu_csv] [env_label]" >&2
+    echo "example: DRY_RUN=1 $0 16 0,1,2,3,4,5,6,7 uv" >&2
     exit 2
     ;;
 esac
 
-mkdir -p "$REPO/run_logs"
+mkdir -p "$LOG_DIR"
 
 JOBS=()
 for variant in "${VARIANTS[@]}"; do
@@ -49,15 +53,33 @@ if [[ "${#JOBS[@]}" -ne "$expected" ]]; then
   exit 3
 fi
 
-echo "elastic soft-prior sweep plan=$PLAN gpus=${GPUS_CSV} conda=${CONDA_ENV} tag=${RUN_TAG}"
+echo "elastic soft-prior sweep plan=$PLAN gpus=${GPUS_CSV} env=${ENV_LABEL} tag=${RUN_TAG}"
+echo "project root: $PROJECT_ROOT"
+echo "logs: $LOG_DIR"
+echo "wandb mode: ${WANDB_MODE:-online}"
+echo "wandb project: ${WANDB_PROJECT:-DSRL_diffusion_FV}"
+echo "wandb group prefix: $WANDB_GROUP_PREFIX"
 echo "tasks: ${TASKS[*]}"
 echo "seeds: ${SEEDS[*]}"
 echo "variants: ${VARIANTS[*]}"
 echo
+
+GPU_COUNTS=()
+SESSIONS=()
 for i in "${!JOBS[@]}"; do
   read -r task seed variant <<< "${JOBS[$i]}"
-  gpu="${GPUS[$((i % ${#GPUS[@]}))]}"
-  printf '%02d gpu=%s task=%s seed=%s variant=%s\n' "$i" "$gpu" "$task" "$seed" "$variant"
+  gpu_idx=$((i % ${#GPUS[@]}))
+  gpu="${GPUS[$gpu_idx]}"
+  GPU_COUNTS[$gpu_idx]=$(( ${GPU_COUNTS[$gpu_idx]:-0} + 1 ))
+  session="dsrl_soft_p${PLAN}_j$(printf '%02d' "$i")_g${gpu}_${task}_s${seed}_${variant}_${RUN_TAG}"
+  log="$LOG_DIR/${RUN_TAG}_j$(printf '%02d' "$i")_${task}_elastic_${variant}_seed${seed}_gpu${gpu}.log"
+  SESSIONS+=("$session")
+  printf '%02d gpu=%s task=%s seed=%s variant=%s session=%s log=%s\n' "$i" "$gpu" "$task" "$seed" "$variant" "$session" "$log"
+done
+
+echo
+for gpu_idx in "${!GPUS[@]}"; do
+  echo "gpu=${GPUS[$gpu_idx]} jobs=${GPU_COUNTS[$gpu_idx]:-0}"
 done
 
 if [[ "$DRY_RUN" == "1" ]]; then
@@ -66,34 +88,50 @@ if [[ "$DRY_RUN" == "1" ]]; then
   exit 0
 fi
 
-for worker_idx in "${!GPUS[@]}"; do
-  gpu="${GPUS[$worker_idx]}"
-  session="dsrl_diff_elastic_p${PLAN}_g${gpu}_${RUN_TAG}"
-  cmd="set -euo pipefail; cd '$REPO'; export RUN_TAG='$RUN_TAG'; export CONDA_ENV='$CONDA_ENV'; export WANDB_GROUP_PREFIX='elastic_softprior_p${PLAN}';"
-  assigned=0
-  for i in "${!JOBS[@]}"; do
-    if [[ $((i % ${#GPUS[@]})) -ne "$worker_idx" ]]; then
-      continue
-    fi
-    read -r task seed variant <<< "${JOBS[$i]}"
-    log="$REPO/run_logs/${RUN_TAG}_${task}_elastic_${variant}_seed${seed}_gpu${gpu}.log"
-    cmd+=" echo '=== start job index=${i} task=${task} seed=${seed} variant=${variant} gpu=${gpu} ===';"
-    cmd+=" bash scripts/launch_elastic_softprior.sh '${task}' '${gpu}' '${seed}' '${CONDA_ENV}' '${variant}' 2>&1 | tee '${log}';"
-    cmd+=" echo '=== finished job index=${i} task=${task} seed=${seed} variant=${variant} gpu=${gpu} ===';"
-    assigned=$((assigned + 1))
-  done
-  if [[ "$assigned" -eq 0 ]]; then
-    continue
-  fi
+if ! command -v tmux >/dev/null 2>&1; then
+  echo "tmux is not installed or not on PATH" >&2
+  exit 4
+fi
+
+for session in "${SESSIONS[@]}"; do
   if tmux has-session -t "$session" 2>/dev/null; then
     echo "tmux session already exists: $session" >&2
-    exit 4
+    exit 5
   fi
+done
+
+for i in "${!JOBS[@]}"; do
+  read -r task seed variant <<< "${JOBS[$i]}"
+  gpu="${GPUS[$((i % ${#GPUS[@]}))]}"
+  session="${SESSIONS[$i]}"
+  log="$LOG_DIR/${RUN_TAG}_j$(printf '%02d' "$i")_${task}_elastic_${variant}_seed${seed}_gpu${gpu}.log"
+
+  cmd="set -euo pipefail;"
+  cmd+=" cd '$PROJECT_ROOT';"
+  cmd+=" export RUN_TAG='$RUN_TAG';"
+  cmd+=" export WANDB_GROUP_PREFIX='$WANDB_GROUP_PREFIX';"
+  cmd+=" export WANDB_MODE='${WANDB_MODE:-online}';"
+  cmd+=" export WANDB_PROJECT='${WANDB_PROJECT:-DSRL_diffusion_FV}';"
+  if [[ -n "${WANDB_ENTITY:-}" ]]; then
+    cmd+=" export WANDB_ENTITY='$WANDB_ENTITY';"
+  fi
+  cmd+=" export OMP_NUM_THREADS='${OMP_NUM_THREADS:-1}';"
+  cmd+=" export MKL_NUM_THREADS='${MKL_NUM_THREADS:-1}';"
+  cmd+=" export OPENBLAS_NUM_THREADS='${OPENBLAS_NUM_THREADS:-1}';"
+  cmd+=" export NUMEXPR_NUM_THREADS='${NUMEXPR_NUM_THREADS:-1}';"
+  cmd+=" echo '=== start job index=${i} task=${task} seed=${seed} variant=${variant} gpu=${gpu} ===';"
+  cmd+=" bash scripts/launch_elastic_softprior.sh '${task}' '${gpu}' '${seed}' '${ENV_LABEL}' '${variant}' 2>&1 | tee '${log}';"
+  cmd+=" echo '=== finished job index=${i} task=${task} seed=${seed} variant=${variant} gpu=${gpu} ===';"
+
   tmux new-session -d -s "$session" "bash -lc $(printf '%q' "$cmd")"
-  echo "started $session with $assigned queued jobs on gpu $gpu"
+  echo "started $session on gpu $gpu"
 done
 
 echo
-echo "monitor: tmux ls | grep dsrl_diff_elastic"
-echo "logs: $REPO/run_logs/${RUN_TAG}_*.log"
-
+echo "started ${#JOBS[@]} tmux sessions"
+echo "monitor:"
+echo "  tmux ls | grep dsrl_soft_p${PLAN}"
+echo "attach one:"
+echo "  tmux attach -t ${SESSIONS[0]}"
+echo "logs:"
+echo "  tail -f $LOG_DIR/${RUN_TAG}_*.log"
