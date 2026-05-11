@@ -199,7 +199,7 @@ class DSRL(OffPolicyAlgorithm):
 		eval_success_ema_beta: float = 0.8,
 		range_success_ema_beta: Optional[float] = None,
 		difficulty_success_ema_beta: Optional[float] = None,
-		stochastic_rounding: bool = True,
+		stochastic_rounding: bool = False,
 	):
 		super().__init__(
 			policy,
@@ -374,10 +374,14 @@ class DSRL(OffPolicyAlgorithm):
 		self._eval_nfes: list[float] = []
 		self._eval_steps: list[float] = []
 		self._eval_chunks: list[float] = []
+		self._eval_steps_target: list[float] = []
+		self._eval_chunks_target: list[float] = []
 		self._eval_difficulties: list[float] = []
 		self._eval_prior_u: list[float] = []
 		self._last_eval_steps: Optional[np.ndarray] = None
 		self._last_eval_chunks: Optional[np.ndarray] = None
+		self._last_eval_steps_target: Optional[np.ndarray] = None
+		self._last_eval_chunks_target: Optional[np.ndarray] = None
 		self._last_eval_difficulty: Optional[np.ndarray] = None
 		self._eval_success_ema: Optional[float] = None
 		self._range_success_ema: Optional[float] = None
@@ -849,6 +853,16 @@ class DSRL(OffPolicyAlgorithm):
 	def _record_eval_schedule(self, steps_ctrl: th.Tensor, chunk_ctrl: th.Tensor, deterministic: bool) -> None:
 		if not self._eval_tracking:
 			return
+		step_targets = self._map_control_to_float(
+			steps_ctrl,
+			self.min_denoising_steps,
+			self.max_denoising_steps,
+		).to(dtype=th.float32)
+		chunk_targets = self._map_control_to_float(
+			chunk_ctrl,
+			self.min_chunk_size,
+			self.max_chunk_size,
+		).to(dtype=th.float32)
 		step_vals = self._map_control_to_int(
 			steps_ctrl,
 			self.min_denoising_steps,
@@ -865,6 +879,8 @@ class DSRL(OffPolicyAlgorithm):
 		info = self._last_schedule_info
 		self._eval_steps.extend(step_vals.detach().cpu().numpy().tolist())
 		self._eval_chunks.extend(chunk_vals.detach().cpu().numpy().tolist())
+		self._eval_steps_target.extend(step_targets.detach().cpu().numpy().tolist())
+		self._eval_chunks_target.extend(chunk_targets.detach().cpu().numpy().tolist())
 		self._eval_nfes.extend(nfe_vals.detach().cpu().numpy().tolist())
 		if "difficulty" in info:
 			self._eval_difficulties.extend(info["difficulty"].reshape(-1).detach().cpu().numpy().tolist())
@@ -872,6 +888,8 @@ class DSRL(OffPolicyAlgorithm):
 			self._eval_prior_u.extend(info["difficulty_prior_u"].reshape(-1).detach().cpu().numpy().tolist())
 		self._last_eval_steps = step_vals.detach().cpu().numpy().astype(np.float32).reshape(-1)
 		self._last_eval_chunks = chunk_vals.detach().cpu().numpy().astype(np.float32).reshape(-1)
+		self._last_eval_steps_target = step_targets.detach().cpu().numpy().astype(np.float32).reshape(-1)
+		self._last_eval_chunks_target = chunk_targets.detach().cpu().numpy().astype(np.float32).reshape(-1)
 		difficulty = info.get("difficulty")
 		if difficulty is not None:
 			self._last_eval_difficulty = difficulty.reshape(-1).detach().cpu().numpy().astype(np.float32)
@@ -969,6 +987,8 @@ class DSRL(OffPolicyAlgorithm):
 		self._eval_nfes = []
 		self._eval_steps = []
 		self._eval_chunks = []
+		self._eval_steps_target = []
+		self._eval_chunks_target = []
 		self._eval_difficulties = []
 		self._eval_prior_u = []
 
@@ -979,13 +999,25 @@ class DSRL(OffPolicyAlgorithm):
 				"avg_nfe": 0.0,
 				"avg_steps": 0.0,
 				"avg_chunk": 0.0,
+				"avg_steps_target": 0.0,
+				"avg_chunk_target": 0.0,
+				"target_exec_mismatch_steps": 0.0,
+				"target_exec_mismatch_chunk": 0.0,
 				"avg_difficulty": 0.0,
 				"avg_difficulty_prior_u": 0.0,
 			}
+		steps_target = np.asarray(self._eval_steps_target, dtype=np.float32)
+		chunk_target = np.asarray(self._eval_chunks_target, dtype=np.float32)
+		steps_exec = np.asarray(self._eval_steps, dtype=np.float32)
+		chunk_exec = np.asarray(self._eval_chunks, dtype=np.float32)
 		return {
 			"avg_nfe": float(np.mean(self._eval_nfes)),
 			"avg_steps": float(np.mean(self._eval_steps)),
 			"avg_chunk": float(np.mean(self._eval_chunks)),
+			"avg_steps_target": float(np.mean(steps_target)) if steps_target.size > 0 else 0.0,
+			"avg_chunk_target": float(np.mean(chunk_target)) if chunk_target.size > 0 else 0.0,
+			"target_exec_mismatch_steps": float(np.mean(np.abs(steps_exec - steps_target))) if steps_target.size == steps_exec.size and steps_exec.size > 0 else 0.0,
+			"target_exec_mismatch_chunk": float(np.mean(np.abs(chunk_exec - chunk_target))) if chunk_target.size == chunk_exec.size and chunk_exec.size > 0 else 0.0,
 			"avg_difficulty": float(np.mean(self._eval_difficulties)) if len(self._eval_difficulties) > 0 else 0.0,
 			"avg_difficulty_prior_u": float(np.mean(self._eval_prior_u)) if len(self._eval_prior_u) > 0 else 0.0,
 		}
@@ -1083,6 +1115,8 @@ class DSRL(OffPolicyAlgorithm):
 		return {
 			"steps": np.array([]) if self._last_eval_steps is None else self._last_eval_steps.copy(),
 			"chunk_requested": np.array([]) if self._last_eval_chunks is None else self._last_eval_chunks.copy(),
+			"steps_target": np.array([]) if self._last_eval_steps_target is None else self._last_eval_steps_target.copy(),
+			"chunk_target": np.array([]) if self._last_eval_chunks_target is None else self._last_eval_chunks_target.copy(),
 			"difficulty": np.array([]) if self._last_eval_difficulty is None else self._last_eval_difficulty.copy(),
 		}
 
@@ -1091,13 +1125,18 @@ class DSRL(OffPolicyAlgorithm):
 			return None
 		return self._last_predict_chunk_exec.copy()
 
+	def _map_control_to_float(self, control: th.Tensor, min_value: int, max_value: int) -> th.Tensor:
+		if max_value <= min_value:
+			return th.full((control.shape[0],), float(min_value), device=control.device, dtype=control.dtype)
+		scaled = min_value + (max_value - min_value) * control.squeeze(-1)
+		return th.clamp(scaled, min=float(min_value), max=float(max_value))
+
 	def _map_control_to_int(self, control: th.Tensor, min_value: int, max_value: int, stochastic: bool = False) -> th.Tensor:
 		if max_value <= min_value:
-			return th.full((control.shape[0],), min_value, device=self.device, dtype=th.int64)
-		scaled = min_value + (max_value - min_value) * control.squeeze(-1)
-		scaled = th.clamp(scaled, min=float(min_value), max=float(max_value))
+			return th.full((control.shape[0],), int(min_value), device=control.device, dtype=th.int64)
+		scaled = self._map_control_to_float(control, min_value, max_value)
 		if not stochastic:
-			return th.round(scaled).to(dtype=th.int64)
+			return th.floor(scaled + 0.5).to(dtype=th.int64)
 		low = th.floor(scaled)
 		high = th.ceil(scaled)
 		prob_high = scaled - low
@@ -1217,6 +1256,12 @@ class DSRL(OffPolicyAlgorithm):
 		entropy_steps, entropy_chunk = [], []
 		denoise_steps_mean, denoise_steps_min, denoise_steps_max = [], [], []
 		chunk_size_mean, chunk_size_min, chunk_size_max = [], [], []
+		denoise_steps_target_mean, chunk_size_target_mean = [], []
+		denoise_target_above_fixed_rate, denoise_target_below_fixed_rate = [], []
+		denoise_exec_above_fixed_rate, denoise_exec_below_fixed_rate = [], []
+		chunk_target_above_fixed_rate, chunk_target_below_fixed_rate = [], []
+		chunk_exec_above_fixed_rate, chunk_exec_below_fixed_rate = [], []
+		target_exec_mismatch_steps, target_exec_mismatch_chunk = [], []
 
 		if self.actor_gradient_steps < 0:
 			actor_gradient_idx = np.linspace(0, gradient_steps - 1, gradient_steps, dtype=int)
@@ -1247,6 +1292,8 @@ class DSRL(OffPolicyAlgorithm):
 			entropy_steps.append((-log_prob_steps).mean().item())
 			entropy_chunk.append((-log_prob_chunk).mean().item())
 			if self.enable_three_head:
+				step_targets = self._map_control_to_float(steps_ctrl, self.min_denoising_steps, self.max_denoising_steps).to(dtype=th.float32)
+				chunk_targets = self._map_control_to_float(chunk_ctrl, self.min_chunk_size, self.max_chunk_size).to(dtype=th.float32)
 				step_vals = self._map_control_to_int(
 					steps_ctrl,
 					self.min_denoising_steps,
@@ -1259,12 +1306,27 @@ class DSRL(OffPolicyAlgorithm):
 					self.max_chunk_size,
 					stochastic=self.stochastic_rounding,
 				).to(dtype=th.float32)
+				base_steps = th.as_tensor(float(self.fixed_denoising_steps), device=step_targets.device, dtype=step_targets.dtype)
+				base_chunk = th.as_tensor(float(self.fixed_chunk_size), device=chunk_targets.device, dtype=chunk_targets.dtype)
+				eps = 1e-6
 				denoise_steps_mean.append(step_vals.mean().item())
 				denoise_steps_min.append(step_vals.min().item())
 				denoise_steps_max.append(step_vals.max().item())
 				chunk_size_mean.append(chunk_vals.mean().item())
 				chunk_size_min.append(chunk_vals.min().item())
 				chunk_size_max.append(chunk_vals.max().item())
+				denoise_steps_target_mean.append(step_targets.mean().item())
+				chunk_size_target_mean.append(chunk_targets.mean().item())
+				denoise_target_above_fixed_rate.append((step_targets > base_steps + eps).float().mean().item())
+				denoise_target_below_fixed_rate.append((step_targets < base_steps - eps).float().mean().item())
+				denoise_exec_above_fixed_rate.append((step_vals > base_steps + eps).float().mean().item())
+				denoise_exec_below_fixed_rate.append((step_vals < base_steps - eps).float().mean().item())
+				chunk_target_above_fixed_rate.append((chunk_targets > base_chunk + eps).float().mean().item())
+				chunk_target_below_fixed_rate.append((chunk_targets < base_chunk - eps).float().mean().item())
+				chunk_exec_above_fixed_rate.append((chunk_vals > base_chunk + eps).float().mean().item())
+				chunk_exec_below_fixed_rate.append((chunk_vals < base_chunk - eps).float().mean().item())
+				target_exec_mismatch_steps.append((step_vals - step_targets).abs().mean().item())
+				target_exec_mismatch_chunk.append((chunk_vals - chunk_targets).abs().mean().item())
 
 			ent_coef_loss = None
 			if self.ent_coef_optimizer is not None and self.log_ent_coef is not None:
@@ -1462,6 +1524,18 @@ class DSRL(OffPolicyAlgorithm):
 			self.logger.record("train/chunk_size_mean", np.mean(chunk_size_mean))
 			self.logger.record("train/chunk_size_min", np.mean(chunk_size_min))
 			self.logger.record("train/chunk_size_max", np.mean(chunk_size_max))
+			self.logger.record("train/denoising_steps_target_mean", np.mean(denoise_steps_target_mean))
+			self.logger.record("train/chunk_size_target_mean", np.mean(chunk_size_target_mean))
+			self.logger.record("train/denoising_target_above_fixed_rate", np.mean(denoise_target_above_fixed_rate))
+			self.logger.record("train/denoising_target_below_fixed_rate", np.mean(denoise_target_below_fixed_rate))
+			self.logger.record("train/denoising_exec_above_fixed_rate", np.mean(denoise_exec_above_fixed_rate))
+			self.logger.record("train/denoising_exec_below_fixed_rate", np.mean(denoise_exec_below_fixed_rate))
+			self.logger.record("train/chunk_target_above_fixed_rate", np.mean(chunk_target_above_fixed_rate))
+			self.logger.record("train/chunk_target_below_fixed_rate", np.mean(chunk_target_below_fixed_rate))
+			self.logger.record("train/chunk_exec_above_fixed_rate", np.mean(chunk_exec_above_fixed_rate))
+			self.logger.record("train/chunk_exec_below_fixed_rate", np.mean(chunk_exec_below_fixed_rate))
+			self.logger.record("train/target_exec_mismatch_steps", np.mean(target_exec_mismatch_steps))
+			self.logger.record("train/target_exec_mismatch_chunk", np.mean(target_exec_mismatch_chunk))
 			self.logger.record("train/scheduling_active", float(train_scheduling))
 			self.logger.record("train/schedule_control_mode_id", self._mode_id())
 			if len(schedule_gates) > 0:

@@ -464,6 +464,10 @@ class LoggingCallback(BaseCallback):
 						elastic_payload = {
 							"eval/avg_denoising_steps": elastic_stats.get("avg_steps", 0.0),
 							"eval/avg_chunk_size": elastic_stats.get("avg_chunk", 0.0),
+							"eval/avg_denoising_steps_target": elastic_stats.get("avg_steps_target", 0.0),
+							"eval/avg_chunk_size_target": elastic_stats.get("avg_chunk_target", 0.0),
+							"eval/target_exec_mismatch_steps": elastic_stats.get("target_exec_mismatch_steps", 0.0),
+							"eval/target_exec_mismatch_chunk": elastic_stats.get("target_exec_mismatch_chunk", 0.0),
 							"eval/avg_difficulty": elastic_stats.get("avg_difficulty", 0.0),
 							"eval/avg_difficulty_prior_u": elastic_stats.get("avg_difficulty_prior_u", 0.0),
 							"evaluation/requested_nfe_amortized": requested_nfe,

@@ -114,7 +114,7 @@ train:
   episode_success_threshold: -0.5
   # True chunk elasticity replans after the executed prefix of the horizon-4 action sequence.
   enable_chunk_elasticity: True
-  stochastic_rounding: True
+  stochastic_rounding: False
   range_alpha_mode: step_success
   range_actuator_floor: 0.35
   range_success_thresh_1: 0.45

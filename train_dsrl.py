@@ -249,7 +249,7 @@ def main(cfg: OmegaConf):
 			eval_success_ema_beta=cfg.train.get("eval_success_ema_beta", 0.8),
 			range_success_ema_beta=cfg.train.get("range_success_ema_beta", None),
 			difficulty_success_ema_beta=cfg.train.get("difficulty_success_ema_beta", None),
-			stochastic_rounding=cfg.train.get("stochastic_rounding", True),
+			stochastic_rounding=cfg.train.get("stochastic_rounding", False),
 		)
 
 	save_checkpoint = cfg.get("save_checkpoint", True)

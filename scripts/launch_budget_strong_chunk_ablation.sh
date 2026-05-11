@@ -225,7 +225,7 @@ python train_dsrl.py --config-name "dsrl_${TASK}.yaml" \
   ++train.nfe_saving_weight="$NFE_SAVING_WEIGHT" \
   ++train.episode_success_threshold="$EPISODE_SUCCESS_THRESHOLD" \
   ++train.enable_chunk_elasticity="$ENABLE_CHUNK" \
-  ++train.stochastic_rounding=true \
+  ++train.stochastic_rounding=false \
   ++train.range_alpha_mode=step_success \
   ++train.range_actuator_floor="$RANGE_ACTUATOR_FLOOR" \
   ++train.range_success_thresh_1="$RANGE_SUCCESS_THRESH_1" \
