@@ -201,7 +201,17 @@ class DiffusionModel(nn.Module):
 
     # ---------- Sampling ----------#
 
-    def p_mean_var(self, x, t, cond, index=None, network_override=None, deterministic=False):
+    def p_mean_var(
+        self,
+        x,
+        t,
+        cond,
+        index=None,
+        network_override=None,
+        deterministic=False,
+        ddim_alpha=None,
+        ddim_alpha_prev=None,
+    ):
         if network_override is not None:
             noise = network_override(x, t, cond=cond)
         else:
@@ -213,11 +223,16 @@ class DiffusionModel(nn.Module):
                 """
                 x₀ = (xₜ - √ (1-αₜ) ε )/ √ αₜ
                 """
-                alpha = extract(self.ddim_alphas, index, x.shape)
-                alpha_prev = extract(self.ddim_alphas_prev, index, x.shape)
-                sqrt_one_minus_alpha = extract(
-                    self.ddim_sqrt_one_minus_alphas, index, x.shape
-                )
+                if ddim_alpha is None:
+                    alpha = extract(self.ddim_alphas, index, x.shape)
+                    alpha_prev = extract(self.ddim_alphas_prev, index, x.shape)
+                    sqrt_one_minus_alpha = extract(
+                        self.ddim_sqrt_one_minus_alphas, index, x.shape
+                    )
+                else:
+                    alpha = ddim_alpha
+                    alpha_prev = ddim_alpha_prev
+                    sqrt_one_minus_alpha = torch.sqrt(torch.clamp(1.0 - alpha, min=0.0))
                 x_recon = (x - sqrt_one_minus_alpha * noise) / (alpha**0.5)
             else:
                 """
@@ -246,9 +261,12 @@ class DiffusionModel(nn.Module):
 
             eta=0
             """
-            sigma = extract(self.ddim_sigmas, index, x.shape)
+            if ddim_alpha_prev is None:
+                sigma = extract(self.ddim_sigmas, index, x.shape)
+            else:
+                sigma = torch.zeros_like(alpha_prev)
             # sigma should be 0
-            dir_xt = (1.0 - alpha_prev - sigma**2).sqrt() * noise
+            dir_xt = torch.sqrt(torch.clamp(1.0 - alpha_prev - sigma**2, min=0.0)) * noise
             mu = (alpha_prev**0.5) * x_recon + dir_xt
             var = sigma**2
             logvar = torch.log(var)
@@ -306,34 +324,58 @@ class DiffusionModel(nn.Module):
         elif step_budget.shape[0] != B:
             raise ValueError(f"num_steps batch size mismatch: got {step_budget.shape[0]}, expected {B}")
 
-        for i, t in enumerate(t_all):
-            active_mask = (i < step_budget).view(B, 1, 1)
-            if not torch.any(active_mask):
-                break
-            t_b = make_timesteps(B, t, device)
-            index_b = make_timesteps(B, i, device)
-            mean, logvar = self.p_mean_var(
-                x=x,
-                t=t_b,
-                cond=cond,
-                index=index_b,
-                deterministic=deterministic,
-            )
-            std = torch.exp(0.5 * logvar)
-
-            # Determine noise level
-            if self.use_ddim:
-                std = torch.zeros_like(std)
-            else:
+        if self.use_ddim:
+            max_budget = int(step_budget.max().item())
+            full_steps = torch.full_like(step_budget, int(self.denoising_steps))
+            step_ratio = torch.div(full_steps, step_budget, rounding_mode="floor").clamp(min=1)
+            ones_alpha = torch.ones((B, 1, 1), device=device, dtype=self.alphas_cumprod.dtype)
+            for i in range(max_budget):
+                active_mask = (i < step_budget).view(B, 1, 1)
+                if not torch.any(active_mask):
+                    break
+                remaining = torch.clamp(step_budget - 1 - i, min=0)
+                t_b = torch.clamp(remaining * step_ratio, max=self.denoising_steps - 1).to(dtype=torch.long)
+                next_remaining = torch.clamp(step_budget - 2 - i, min=0)
+                next_t = torch.clamp(next_remaining * step_ratio, max=self.denoising_steps - 1).to(dtype=torch.long)
+                alpha = self.alphas_cumprod.gather(0, t_b).view(B, 1, 1)
+                next_alpha = self.alphas_cumprod.gather(0, next_t).view(B, 1, 1)
+                has_next = (i + 1 < step_budget).view(B, 1, 1)
+                alpha_prev = torch.where(has_next, next_alpha, ones_alpha)
+                index_b = torch.clamp(i + (max_total_steps - step_budget), min=0, max=max_total_steps - 1).to(dtype=torch.long)
+                mean, _ = self.p_mean_var(
+                    x=x,
+                    t=t_b,
+                    cond=cond,
+                    index=index_b,
+                    deterministic=deterministic,
+                    ddim_alpha=alpha,
+                    ddim_alpha_prev=alpha_prev,
+                )
+                x = torch.where(active_mask, mean, x)
+        else:
+            for i, t in enumerate(t_all):
+                active_mask = (i < step_budget).view(B, 1, 1)
+                if not torch.any(active_mask):
+                    break
+                t_b = make_timesteps(B, t, device)
+                index_b = make_timesteps(B, i, device)
+                mean, logvar = self.p_mean_var(
+                    x=x,
+                    t=t_b,
+                    cond=cond,
+                    index=index_b,
+                    deterministic=deterministic,
+                )
+                std = torch.exp(0.5 * logvar)
                 if t == 0:
                     std = torch.zeros_like(std)
                 else:
                     std = torch.clip(std, min=1e-3)
-            noise = torch.randn_like(x).clamp_(
-                -self.randn_clip_value, self.randn_clip_value
-            )
-            x_next = mean + std * noise
-            x = torch.where(active_mask, x_next, x)
+                noise = torch.randn_like(x).clamp_(
+                    -self.randn_clip_value, self.randn_clip_value
+                )
+                x_next = mean + std * noise
+                x = torch.where(active_mask, x_next, x)
 
         # Clamp final action once after all effective denoising updates.
         if self.final_action_clip_value is not None:

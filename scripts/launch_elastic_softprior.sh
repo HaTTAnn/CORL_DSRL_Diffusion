@@ -4,7 +4,7 @@ set -euo pipefail
 TASK="${1:?usage: launch_elastic_softprior.sh TASK GPU SEED [CONDA_ENV] [VARIANT]}"
 GPU="${2:-7}"
 SEED="${3:-1}"
-CONDA_ENV="${4:-${CONDA_ENV:-dsrl}}"
+CONDA_ENV="${4:-${CONDA_ENV:-dsrl_diffusion}}"
 VARIANT="${5:-soft_h2_bal}"
 
 N_EVAL_ENVS="${N_EVAL_ENVS:-5}"

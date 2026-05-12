@@ -3,7 +3,7 @@ set -euo pipefail
 
 PLAN="${1:-8}"
 GPUS_CSV="${2:-${GPUS:-6,7}}"
-CONDA_ENV="${3:-${CONDA_ENV:-dsrl}}"
+CONDA_ENV="${3:-${CONDA_ENV:-dsrl_diffusion}}"
 REPO="/root/storage/CODE/txy/dsrl_fv"
 RUN_TAG="${RUN_TAG:-$(date +%Y_%m_%d_%H_%M_%S)}"
 DRY_RUN="${DRY_RUN:-0}"
@@ -27,7 +27,7 @@ case "$PLAN" in
     ;;
   *)
     echo "usage: $0 [8|16] [gpu_csv] [conda_env]" >&2
-    echo "example: DRY_RUN=1 $0 16 6,7 dsrl" >&2
+    echo "example: DRY_RUN=1 $0 16 6,7 dsrl_diffusion" >&2
     exit 2
     ;;
 esac

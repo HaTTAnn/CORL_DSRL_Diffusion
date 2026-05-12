@@ -1184,8 +1184,13 @@ class DSRL(OffPolicyAlgorithm):
 				num_steps=num_steps,
 				chunk_size=chunk_size,
 			)
-		except TypeError:
-			return self.diffusion_policy(obs, noise_actions, return_numpy=False)
+		except TypeError as exc:
+			# Backward compatibility only: older wrappers may not accept elastic kwargs.
+			# TypeErrors raised inside the sampler must surface instead of silently disabling elastic steps.
+			message = str(exc)
+			if "num_steps" in message or "chunk_size" in message:
+				return self.diffusion_policy(obs, noise_actions, return_numpy=False)
+			raise
 
 	def _grad_norm(self, parameters) -> float:
 		total = 0.0
