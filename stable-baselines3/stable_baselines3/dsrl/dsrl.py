@@ -383,6 +383,7 @@ class DSRL(OffPolicyAlgorithm):
 		self._last_eval_steps_target: Optional[np.ndarray] = None
 		self._last_eval_chunks_target: Optional[np.ndarray] = None
 		self._last_eval_difficulty: Optional[np.ndarray] = None
+		self._last_eval_prior_u: Optional[np.ndarray] = None
 		self._eval_success_ema: Optional[float] = None
 		self._range_success_ema: Optional[float] = None
 		self._difficulty_success_ema: Optional[float] = None
@@ -726,6 +727,45 @@ class DSRL(OffPolicyAlgorithm):
 				self._difficulty_q_std_second = beta * self._difficulty_q_std_second + (1.0 - beta) * batch_second
 			return q_std.detach()
 
+	def _uses_compute_advantage_signal(self, mode: str) -> bool:
+		mode = str(mode).lower()
+		return mode in {"compute_advantage", "advantage", "value_advantage"} or mode.startswith("compute_advantage_") or mode.startswith("advantage_") or mode.startswith("value_advantage_")
+
+	def _difficulty_signal_transform_mode(self, mode: str) -> str:
+		mode = str(mode).lower()
+		for prefix in ("compute_advantage_", "advantage_", "value_advantage_"):
+			if mode.startswith(prefix):
+				return mode[len(prefix):]
+		if self._uses_compute_advantage_signal(mode):
+			return "rank_tanh"
+		return mode
+
+	def _combine_noise_q_values(self, q_values: th.Tensor) -> th.Tensor:
+		if self.critic_backup_combine_type == "min":
+			combined, _ = th.min(q_values, dim=1, keepdim=True)
+		else:
+			combined = th.mean(q_values, dim=1, keepdim=True)
+		return combined
+
+	def _estimate_compute_advantage(self, obs: th.Tensor, w_noise: Optional[th.Tensor] = None) -> th.Tensor:
+		batch = obs.shape[0]
+		with th.no_grad():
+			if not self.enable_three_head:
+				return th.zeros((batch, 1), device=obs.device, dtype=obs.dtype)
+			if w_noise is None:
+				w_noise, _ = self.actor.action_log_prob(obs)
+			w_noise = w_noise.detach().to(device=obs.device)
+			dtype = w_noise.dtype
+			easy_steps = self._control_from_value(self.difficulty_easy_steps_target, self.min_denoising_steps, self.max_denoising_steps, batch, device=obs.device, dtype=dtype)
+			hard_steps = self._control_from_value(self.difficulty_hard_steps_target, self.min_denoising_steps, self.max_denoising_steps, batch, device=obs.device, dtype=dtype)
+			easy_chunk = self._control_from_value(self.difficulty_easy_chunk_target, self.min_chunk_size, self.max_chunk_size, batch, device=obs.device, dtype=dtype)
+			hard_chunk = self._control_from_value(self.difficulty_hard_chunk_target, self.min_chunk_size, self.max_chunk_size, batch, device=obs.device, dtype=dtype)
+			easy_input = th.cat([w_noise, easy_steps, easy_chunk], dim=1)
+			hard_input = th.cat([w_noise, hard_steps, hard_chunk], dim=1)
+			q_easy = self._combine_noise_q_values(th.cat(self.critic_noise(obs, easy_input), dim=1))
+			q_hard = self._combine_noise_q_values(th.cat(self.critic_noise(obs, hard_input), dim=1))
+			return (q_hard - q_easy).detach()
+
 	def _difficulty_signal_from_q_std(self, q_std: th.Tensor, mode: str, scale: float) -> th.Tensor:
 		mode = str(mode).lower()
 		if mode in {"none", "off", "zero"} or scale <= 0.0:
@@ -842,6 +882,8 @@ class DSRL(OffPolicyAlgorithm):
 		self._last_schedule_info = {
 			"difficulty": zeros,
 			"difficulty_prior_u": zeros,
+			"q_std": zeros,
+			"difficulty_source_score": zeros,
 			"schedule_gate": 0.0,
 			"difficulty_prior_gate": 0.0,
 			"difficulty_loss_gate": 0.0,
@@ -895,6 +937,11 @@ class DSRL(OffPolicyAlgorithm):
 			self._last_eval_difficulty = difficulty.reshape(-1).detach().cpu().numpy().astype(np.float32)
 		else:
 			self._last_eval_difficulty = np.zeros_like(self._last_eval_steps, dtype=np.float32)
+		prior_u = info.get("difficulty_prior_u")
+		if prior_u is not None:
+			self._last_eval_prior_u = prior_u.reshape(-1).detach().cpu().numpy().astype(np.float32)
+		else:
+			self._last_eval_prior_u = np.zeros_like(self._last_eval_steps, dtype=np.float32)
 
 	def _sample_schedule_controls(
 		self,
@@ -927,10 +974,36 @@ class DSRL(OffPolicyAlgorithm):
 			self._record_eval_schedule(default_steps, default_chunk, deterministic)
 			return default_steps, default_log_prob, default_chunk, default_log_prob
 
-		q_std = self._estimate_q_std(obs, w_noise=w_noise)
-		prior_u = self._difficulty_signal_from_q_std(q_std, self.difficulty_prior_signal_mode, self.difficulty_prior_signal_scale)
+		prior_uses_advantage = self._uses_compute_advantage_signal(self.difficulty_prior_signal_mode)
+		difficulty_uses_advantage = self._uses_compute_advantage_signal(self.difficulty_signal_mode)
+		compute_advantage = None
+		q_std = None
+		if prior_uses_advantage or difficulty_uses_advantage:
+			compute_advantage = self._estimate_compute_advantage(obs, w_noise=w_noise)
+		if (not prior_uses_advantage) or (not difficulty_uses_advantage):
+			q_std = self._estimate_q_std(obs, w_noise=w_noise)
+		zero_score = th.zeros((batch, 1), device=obs.device, dtype=obs.dtype)
+		prior_score = compute_advantage if prior_uses_advantage else q_std
+		difficulty_score = compute_advantage if difficulty_uses_advantage else q_std
+		if prior_score is None:
+			prior_score = zero_score
+		if difficulty_score is None:
+			difficulty_score = zero_score
+		difficulty_source_score = compute_advantage if compute_advantage is not None else q_std
+		if difficulty_source_score is None:
+			difficulty_source_score = zero_score
+		q_std_log = q_std if q_std is not None else zero_score
+		prior_u = self._difficulty_signal_from_q_std(
+			prior_score,
+			self._difficulty_signal_transform_mode(self.difficulty_prior_signal_mode),
+			self.difficulty_prior_signal_scale,
+		)
 		prior_u = self._apply_signal_deadband(prior_u, self.difficulty_prior_deadband)
-		difficulty = self._difficulty_signal_from_q_std(q_std, self.difficulty_signal_mode, self.difficulty_signal_scale)
+		difficulty = self._difficulty_signal_from_q_std(
+			difficulty_score,
+			self._difficulty_signal_transform_mode(self.difficulty_signal_mode),
+			self.difficulty_signal_scale,
+		)
 		prior_steps, prior_chunk, prior_gate = self._prior_controls(prior_u, default_steps, default_chunk)
 		schedule_step_gate = self._ramp_gate(float(self.schedule_heads_after), self.schedule_warmup_steps, self.schedule_gate_floor)
 		schedule_gate = schedule_step_gate * self._range_actuator_gate()
@@ -969,6 +1042,8 @@ class DSRL(OffPolicyAlgorithm):
 		self._last_schedule_info = {
 			"difficulty": difficulty.detach(),
 			"difficulty_prior_u": prior_u.detach(),
+			"q_std": q_std_log.detach(),
+			"difficulty_source_score": difficulty_source_score.detach(),
 			"schedule_gate": float(schedule_gate),
 			"schedule_step_gate": float(schedule_step_gate),
 			"schedule_residual_authority": float(prior_authority),
@@ -1004,7 +1079,9 @@ class DSRL(OffPolicyAlgorithm):
 				"target_exec_mismatch_steps": 0.0,
 				"target_exec_mismatch_chunk": 0.0,
 				"avg_difficulty": 0.0,
+				"avg_difficulty_abs": 0.0,
 				"avg_difficulty_prior_u": 0.0,
+				"avg_difficulty_prior_u_abs": 0.0,
 			}
 		steps_target = np.asarray(self._eval_steps_target, dtype=np.float32)
 		chunk_target = np.asarray(self._eval_chunks_target, dtype=np.float32)
@@ -1019,7 +1096,9 @@ class DSRL(OffPolicyAlgorithm):
 			"target_exec_mismatch_steps": float(np.mean(np.abs(steps_exec - steps_target))) if steps_target.size == steps_exec.size and steps_exec.size > 0 else 0.0,
 			"target_exec_mismatch_chunk": float(np.mean(np.abs(chunk_exec - chunk_target))) if chunk_target.size == chunk_exec.size and chunk_exec.size > 0 else 0.0,
 			"avg_difficulty": float(np.mean(self._eval_difficulties)) if len(self._eval_difficulties) > 0 else 0.0,
+			"avg_difficulty_abs": float(np.mean(np.abs(self._eval_difficulties))) if len(self._eval_difficulties) > 0 else 0.0,
 			"avg_difficulty_prior_u": float(np.mean(self._eval_prior_u)) if len(self._eval_prior_u) > 0 else 0.0,
+			"avg_difficulty_prior_u_abs": float(np.mean(np.abs(self._eval_prior_u))) if len(self._eval_prior_u) > 0 else 0.0,
 		}
 
 	def update_phase_from_eval(self, success_rate: float, avg_nfe: float) -> None:
@@ -1118,6 +1197,7 @@ class DSRL(OffPolicyAlgorithm):
 			"steps_target": np.array([]) if self._last_eval_steps_target is None else self._last_eval_steps_target.copy(),
 			"chunk_target": np.array([]) if self._last_eval_chunks_target is None else self._last_eval_chunks_target.copy(),
 			"difficulty": np.array([]) if self._last_eval_difficulty is None else self._last_eval_difficulty.copy(),
+			"difficulty_prior_u": np.array([]) if self._last_eval_prior_u is None else self._last_eval_prior_u.copy(),
 		}
 
 	def get_last_predict_chunk_exec(self) -> Optional[np.ndarray]:
@@ -1238,7 +1318,21 @@ class DSRL(OffPolicyAlgorithm):
 		q_target_gap_mean_batch: list[float] = []
 		actor_compute_cost_batch: list[float] = []
 		difficulty_batch: list[float] = []
+		difficulty_abs_batch: list[float] = []
+		difficulty_min_batch: list[float] = []
+		difficulty_max_batch: list[float] = []
 		difficulty_prior_batch: list[float] = []
+		difficulty_prior_abs_batch: list[float] = []
+		difficulty_prior_min_batch: list[float] = []
+		difficulty_prior_max_batch: list[float] = []
+		difficulty_q_std_mean_batch: list[float] = []
+		difficulty_q_std_std_batch: list[float] = []
+		difficulty_q_std_min_batch: list[float] = []
+		difficulty_q_std_max_batch: list[float] = []
+		difficulty_source_mean_batch: list[float] = []
+		difficulty_source_std_batch: list[float] = []
+		difficulty_source_min_batch: list[float] = []
+		difficulty_source_max_batch: list[float] = []
 		difficulty_losses: list[float] = []
 		schedule_entropy_batch: list[float] = []
 		difficulty_loss_gates: list[float] = []
@@ -1436,7 +1530,11 @@ class DSRL(OffPolicyAlgorithm):
 						if diff_loss.requires_grad or diff_loss.item() != 0.0:
 							actor_loss = actor_loss + diff_loss
 						difficulty_losses.append(float(diff_loss.detach().item()))
-						difficulty_batch.append(float(difficulty.mean().item()))
+						difficulty_detached = difficulty.detach()
+						difficulty_batch.append(float(difficulty_detached.mean().item()))
+						difficulty_abs_batch.append(float(difficulty_detached.abs().mean().item()))
+						difficulty_min_batch.append(float(difficulty_detached.min().item()))
+						difficulty_max_batch.append(float(difficulty_detached.max().item()))
 						difficulty_loss_gates.append(diff_logs.get("difficulty_loss_gate", 0.0))
 						difficulty_margin_gates.append(diff_logs.get("difficulty_margin_gate", 0.0))
 						difficulty_combined_gates.append(diff_logs.get("difficulty_combined_gate", 0.0))
@@ -1446,7 +1544,25 @@ class DSRL(OffPolicyAlgorithm):
 						monotonic_inversion_rates.append(diff_logs.get("monotonic_inversion_rate", 0.0))
 					prior_u = schedule_info.get("difficulty_prior_u")
 					if prior_u is not None:
-						difficulty_prior_batch.append(float(prior_u.detach().mean().item()))
+						prior_u_detached = prior_u.detach()
+						difficulty_prior_batch.append(float(prior_u_detached.mean().item()))
+						difficulty_prior_abs_batch.append(float(prior_u_detached.abs().mean().item()))
+						difficulty_prior_min_batch.append(float(prior_u_detached.min().item()))
+						difficulty_prior_max_batch.append(float(prior_u_detached.max().item()))
+					q_std = schedule_info.get("q_std")
+					if q_std is not None:
+						q_std_detached = q_std.detach()
+						difficulty_q_std_mean_batch.append(float(q_std_detached.mean().item()))
+						difficulty_q_std_std_batch.append(float(q_std_detached.std(unbiased=False).item()))
+						difficulty_q_std_min_batch.append(float(q_std_detached.min().item()))
+						difficulty_q_std_max_batch.append(float(q_std_detached.max().item()))
+					source_score = schedule_info.get("difficulty_source_score")
+					if source_score is not None:
+						source_score_detached = source_score.detach()
+						difficulty_source_mean_batch.append(float(source_score_detached.mean().item()))
+						difficulty_source_std_batch.append(float(source_score_detached.std(unbiased=False).item()))
+						difficulty_source_min_batch.append(float(source_score_detached.min().item()))
+						difficulty_source_max_batch.append(float(source_score_detached.max().item()))
 					schedule_gates.append(float(schedule_info.get("schedule_gate", 0.0)))
 					prior_gates.append(float(schedule_info.get("difficulty_prior_gate", 0.0)))
 					schedule_residual_scales.append(float(schedule_info.get("active_schedule_residual_scale", 0.0)))
@@ -1513,8 +1629,24 @@ class DSRL(OffPolicyAlgorithm):
 			self.logger.record("train/actor_compute_cost_mean", np.mean(actor_compute_cost_batch))
 		if len(difficulty_batch) > 0:
 			self.logger.record("train/difficulty_mean", np.mean(difficulty_batch))
+			self.logger.record("train/difficulty_abs_mean", np.mean(difficulty_abs_batch))
+			self.logger.record("train/difficulty_min", np.mean(difficulty_min_batch))
+			self.logger.record("train/difficulty_max", np.mean(difficulty_max_batch))
 		if len(difficulty_prior_batch) > 0:
 			self.logger.record("train/difficulty_prior_u_mean", np.mean(difficulty_prior_batch))
+			self.logger.record("train/difficulty_prior_u_abs_mean", np.mean(difficulty_prior_abs_batch))
+			self.logger.record("train/difficulty_prior_u_min", np.mean(difficulty_prior_min_batch))
+			self.logger.record("train/difficulty_prior_u_max", np.mean(difficulty_prior_max_batch))
+		if len(difficulty_q_std_mean_batch) > 0:
+			self.logger.record("train/difficulty_q_std_mean", np.mean(difficulty_q_std_mean_batch))
+			self.logger.record("train/difficulty_q_std_std", np.mean(difficulty_q_std_std_batch))
+			self.logger.record("train/difficulty_q_std_min", np.mean(difficulty_q_std_min_batch))
+			self.logger.record("train/difficulty_q_std_max", np.mean(difficulty_q_std_max_batch))
+		if len(difficulty_source_mean_batch) > 0:
+			self.logger.record("train/difficulty_source_score_mean", np.mean(difficulty_source_mean_batch))
+			self.logger.record("train/difficulty_source_score_std", np.mean(difficulty_source_std_batch))
+			self.logger.record("train/difficulty_source_score_min", np.mean(difficulty_source_min_batch))
+			self.logger.record("train/difficulty_source_score_max", np.mean(difficulty_source_max_batch))
 		if len(difficulty_losses) > 0:
 			self.logger.record("train/difficulty_loss", np.mean(difficulty_losses))
 		if len(schedule_entropy_batch) > 0:
@@ -1638,36 +1770,116 @@ class DSRL(OffPolicyAlgorithm):
 
 
 	def update_noise_critic(self, replay_data):
-		# Distill Q^w toward Q^A; only critic_noise is updated (w and schedule detached — unchanged from prior code).
+		# Distill Q^w toward Q^A. For elastic scheduling, critic_noise must cover the
+		# schedule points used by compute_advantage, not only the actor's current schedule.
+		obs = replay_data.observations
+		batch = obs.shape[0]
 		train_scheduling = self._schedule_training_active()
+
+		def _scaled_to_noise_tensor(w_scaled: th.Tensor) -> th.Tensor:
+			w_unscaled = th.as_tensor(
+				self.policy.unscale_action(w_scaled.detach().cpu().numpy()),
+				device=self.device,
+				dtype=w_scaled.dtype,
+			)
+			return w_unscaled.reshape(-1, self.diffusion_act_chunk, self.diffusion_act_dim)
+
+		def _random_scaled_noise(dtype: th.dtype) -> th.Tensor:
+			noise_actions = th.randn(batch, self.diffusion_act_chunk, self.diffusion_act_dim, device=self.device, dtype=dtype)
+			noise_flat = noise_actions.reshape(batch, self.diffusion_act_chunk * self.diffusion_act_dim)
+			return th.as_tensor(self.policy.scale_action(noise_flat.detach().cpu().numpy()), device=self.device, dtype=dtype)
+
+		def _distill_case(
+			w_scaled: th.Tensor,
+			steps_ctrl: Optional[th.Tensor] = None,
+			chunk_ctrl: Optional[th.Tensor] = None,
+		) -> th.Tensor:
+			with th.no_grad():
+				diffused_actions = self._apply_diffusion(
+					obs,
+					_scaled_to_noise_tensor(w_scaled),
+					steps_ctrl=steps_ctrl,
+					chunk_ctrl=chunk_ctrl,
+				)
+				diffused_actions = diffused_actions.reshape(-1, self.diffusion_act_chunk * self.diffusion_act_dim)
+				current_q_values = self.critic(obs, diffused_actions)
+			noise_input = w_scaled.detach()
+			if self.enable_three_head:
+				assert steps_ctrl is not None and chunk_ctrl is not None
+				noise_input = th.cat([noise_input, steps_ctrl.detach(), chunk_ctrl.detach()], dim=1)
+			current_q_noise_vals = self.critic_noise(obs, noise_input)
+			case_loss = 0
+			for i in range(len(current_q_values)):
+				case_loss = case_loss + 0.5 * F.mse_loss(current_q_values[i].detach(), current_q_noise_vals[i])
+			return case_loss
+
 		with th.no_grad():
-			w_pi, _ = self.actor.action_log_prob(replay_data.observations)
+			w_pi, _ = self.actor.action_log_prob(obs)
+			w_pi = w_pi.detach()
+
+		if not self.enable_three_head:
+			# Match official DSRL: train Q^w on broad random latent noise, not only actor samples.
+			return _distill_case(_random_scaled_noise(w_pi.dtype))
+
+		with th.no_grad():
 			steps_ctrl, _, chunk_ctrl, _ = self._sample_schedule_controls(
-				replay_data.observations,
+				obs,
 				deterministic=False,
 				train_scheduling=train_scheduling,
-				w_noise=w_pi.detach(),
+				w_noise=w_pi,
 			)
-			w_unscaled = th.tensor(self.policy.unscale_action(w_pi.cpu().numpy()), device=self.device, dtype=w_pi.dtype)
-			noise_actions_tensor = w_unscaled.reshape(-1, self.diffusion_act_chunk, self.diffusion_act_dim)
-			diffused_actions = self._apply_diffusion(
-				replay_data.observations,
-				noise_actions_tensor,
-				steps_ctrl=steps_ctrl,
-				chunk_ctrl=chunk_ctrl,
+			easy_steps = self._control_from_value(
+				self.difficulty_easy_steps_target,
+				self.min_denoising_steps,
+				self.max_denoising_steps,
+				batch,
+				device=obs.device,
+				dtype=w_pi.dtype,
 			)
-			diffused_actions = diffused_actions.reshape(-1, self.diffusion_act_chunk * self.diffusion_act_dim)
-			current_q_values = self.critic(replay_data.observations, diffused_actions)
-		noise_input = w_pi.detach()
-		if self.enable_three_head:
-			noise_input = th.cat([noise_input, steps_ctrl.detach(), chunk_ctrl.detach()], dim=1)
-		current_q_noise_vals = self.critic_noise(replay_data.observations, noise_input)
-		critic_distill_loss = 0
-		for i in range(len(current_q_values)):
-			current_q = current_q_values[i]
-			current_q_noise = current_q_noise_vals[i]
-			critic_distill_loss = critic_distill_loss + 0.5*F.mse_loss(current_q.detach(), current_q_noise)
-		return critic_distill_loss
+			hard_steps = self._control_from_value(
+				self.difficulty_hard_steps_target,
+				self.min_denoising_steps,
+				self.max_denoising_steps,
+				batch,
+				device=obs.device,
+				dtype=w_pi.dtype,
+			)
+			easy_chunk = self._control_from_value(
+				self.difficulty_easy_chunk_target,
+				self.min_chunk_size,
+				self.max_chunk_size,
+				batch,
+				device=obs.device,
+				dtype=w_pi.dtype,
+			)
+			hard_chunk = self._control_from_value(
+				self.difficulty_hard_chunk_target,
+				self.min_chunk_size,
+				self.max_chunk_size,
+				batch,
+				device=obs.device,
+				dtype=w_pi.dtype,
+			)
+			default_steps = self._control_from_fixed(
+				self.fixed_denoising_steps,
+				self.min_denoising_steps,
+				self.max_denoising_steps,
+				batch,
+			).to(device=obs.device, dtype=w_pi.dtype)
+			default_chunk = self._control_from_fixed(
+				self.fixed_chunk_size,
+				self.min_chunk_size,
+				self.max_chunk_size,
+				batch,
+			).to(device=obs.device, dtype=w_pi.dtype)
+
+		losses = [
+			_distill_case(w_pi, steps_ctrl, chunk_ctrl),
+			_distill_case(w_pi, hard_steps, hard_chunk),
+			_distill_case(w_pi, easy_steps, easy_chunk),
+			_distill_case(_random_scaled_noise(w_pi.dtype), default_steps, default_chunk),
+		]
+		return sum(losses) / float(len(losses))
 
 
 	def _set_last_rollout_schedule(self, mapped_steps: th.Tensor, mapped_chunk: th.Tensor) -> None:
@@ -1931,11 +2143,17 @@ class DSRL(OffPolicyAlgorithm):
 			buffer_action = unscaled_action
 			action = buffer_action
 		action = th.as_tensor(action, device=self.device, dtype=th.float32)
+		if isinstance(self.action_space, spaces.Box):
+			schedule_noise = th.as_tensor(scaled_action, device=self.device, dtype=th.float32)
+		else:
+			schedule_noise = action
+		schedule_noise = schedule_noise.reshape(-1, self.diffusion_act_chunk * self.diffusion_act_dim)
 		obs = th.as_tensor(self._last_obs, device=self.device, dtype=th.float32)
 		steps_ctrl, _, chunk_ctrl, _ = self._sample_schedule_controls(
 			obs,
 			deterministic=False,
 			train_scheduling=self._schedule_training_active(),
+			w_noise=schedule_noise,
 		)
 		mapped_steps = self._map_control_to_int(
 			steps_ctrl,
@@ -1982,11 +2200,17 @@ class DSRL(OffPolicyAlgorithm):
 			buffer_action = unscaled_action
 			action = buffer_action
 		action = th.as_tensor(action, device=self.device, dtype=th.float32)
+		if isinstance(self.action_space, spaces.Box):
+			schedule_noise = th.as_tensor(scaled_action, device=self.device, dtype=th.float32)
+		else:
+			schedule_noise = action
+		schedule_noise = schedule_noise.reshape(-1, self.diffusion_act_chunk * self.diffusion_act_dim)
 		obs = th.as_tensor(observation, device=self.device, dtype=th.float32)
 		steps_ctrl, _, chunk_ctrl, _ = self._sample_schedule_controls(
 			obs,
 			deterministic=deterministic,
 			train_scheduling=self._schedule_training_active(),
+			w_noise=schedule_noise,
 		)
 		mapped_steps = self._map_control_to_int(
 			steps_ctrl,

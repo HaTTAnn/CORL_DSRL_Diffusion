@@ -19,15 +19,24 @@ case "$PLAN" in
     TASKS=(can square)
     SEEDS=(0 1)
     VARIANTS=(soft_h2_bal soft_h3_safe)
+    EXPECTED=8
     ;;
   16)
     TASKS=(can square)
     SEEDS=(0 1)
     VARIANTS=(soft_h2_bal soft_h2_res soft_h3_safe soft_h2_edge)
+    EXPECTED=16
+    ;;
+  square_safe)
+    TASKS=(square)
+    SEEDS=(0 1)
+    VARIANTS=(soft_square_safe soft_h3_safe)
+    EXPECTED=4
     ;;
   *)
-    echo "usage: $0 [8|16] [gpu_csv] [conda_env]" >&2
+    echo "usage: $0 [8|16|square_safe] [gpu_csv] [conda_env]" >&2
     echo "example: DRY_RUN=1 $0 16 6,7 dsrl_diffusion" >&2
+    echo "example: DRY_RUN=1 $0 square_safe 6,7 dsrl_diffusion" >&2
     exit 2
     ;;
 esac
@@ -43,7 +52,7 @@ for variant in "${VARIANTS[@]}"; do
   done
 done
 
-expected="$PLAN"
+expected="$EXPECTED"
 if [[ "${#JOBS[@]}" -ne "$expected" ]]; then
   echo "internal error: plan $PLAN produced ${#JOBS[@]} jobs" >&2
   exit 3
