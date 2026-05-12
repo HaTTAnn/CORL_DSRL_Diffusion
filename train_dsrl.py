@@ -287,7 +287,6 @@ def main(cfg: OmegaConf):
 		rew_offset=cfg.env.reward_offset,
 		algorithm=cfg.algorithm,
 		max_steps=MAX_STEPS,
-		deterministic_eval=cfg.deterministic_eval,
 		video_env=video_env,
 		save_eval_video=save_eval_video,
 		eval_video_fps=cfg.env.get("eval_video_fps", 20),
@@ -295,9 +294,7 @@ def main(cfg: OmegaConf):
 		eval_video_freq=cfg.env.get("eval_video_freq", 1),
 	)
 
-	logging_callback.evaluate(model, deterministic=False)
-	if cfg.deterministic_eval:
-		logging_callback.evaluate(model, deterministic=True)
+	logging_callback.evaluate(model)
 	logging_callback.log_count += 1
 
 	if cfg.load_offline_data:

@@ -66,7 +66,6 @@ class LoggingCallback(BaseCallback):
 		num_eval_env=1,
 		algorithm='dsrl_sac',
 		max_steps=-1,
-		deterministic_eval=False,
 		video_env=None,
 		save_eval_video=False,
 		eval_video_fps=20,
@@ -92,7 +91,6 @@ class LoggingCallback(BaseCallback):
 		self.episode_completed = np.zeros(self.num_train_env)
 		self.algorithm = algorithm
 		self.max_steps = max_steps
-		self.deterministic_eval = deterministic_eval
 		self.video_env = video_env
 		self.save_eval_video = bool(save_eval_video)
 		self.eval_video_fps = max(1, int(eval_video_fps))
@@ -186,7 +184,7 @@ class LoggingCallback(BaseCallback):
 		video = np.stack(frames, axis=0)
 		return np.transpose(video, (0, 3, 1, 2))
 
-	def _collect_eval_video(self, agent, deterministic=False):
+	def _collect_eval_video(self, agent):
 		if self.video_env is None:
 			return None
 		env = self.video_env
@@ -205,9 +203,9 @@ class LoggingCallback(BaseCallback):
 			query_cap = min(int(query_cap), self.eval_video_max_frames)
 			for _ in range(query_cap):
 				if self.algorithm == 'dsrl_sac':
-					action, _ = agent.predict(obs, deterministic=deterministic)
+					action, _ = agent.predict(obs, deterministic=False)
 				elif self.algorithm == 'dsrl_na':
-					action, _ = agent.predict_diffused(obs, deterministic=deterministic)
+					action, _ = agent.predict_diffused(obs, deterministic=False)
 					self._set_pending_chunk_exec(env, agent)
 				else:
 					return None
@@ -227,21 +225,20 @@ class LoggingCallback(BaseCallback):
 			return None
 		return self._frames_to_wandb_video(frames)
 
-	def _log_eval_video(self, agent, deterministic=False):
+	def _log_eval_video(self, agent):
 		if not (self.use_wandb and self.save_eval_video and self.video_env is not None):
 			return
 		self._eval_video_calls += 1
 		if (self._eval_video_calls - 1) % self.eval_video_freq != 0:
 			return
-		video = self._collect_eval_video(agent, deterministic=deterministic)
+		video = self._collect_eval_video(agent)
 		if video is None:
 			if not self._eval_video_warned:
 				print("eval video capture returned no frames")
 				self._eval_video_warned = True
 			return
-		key = "eval/video_deterministic" if deterministic else "eval/video"
 		wandb.log({
-			key: wandb.Video(video, fps=self.eval_video_fps, format="mp4")
+			"eval/video": wandb.Video(video, fps=self.eval_video_fps, format="mp4")
 		}, step=self.log_count)
 
 	def _on_step(self):
@@ -337,17 +334,15 @@ class LoggingCallback(BaseCallback):
 				self.episode_completed = np.zeros(self.num_train_env)
 
 		if self.n_calls % self.eval_freq == 0:
-			self.evaluate(self.locals['self'], deterministic=False)
-			if self.deterministic_eval:
-				self.evaluate(self.locals['self'], deterministic=True)
+			self.evaluate(self.locals['self'])
 		return True
 	
-	def evaluate(self, agent, deterministic=False):
+	def evaluate(self, agent):
 		if self.eval_episodes <= 0:
 			return
 		env = self.eval_env
 		with torch.no_grad():
-			track_elastic = self.algorithm == 'dsrl_na' and (not deterministic) and hasattr(agent, "start_eval_tracking")
+			track_elastic = self.algorithm == 'dsrl_na' and hasattr(agent, "start_eval_tracking")
 			if track_elastic:
 				agent.start_eval_tracking()
 			success = []
@@ -379,9 +374,9 @@ class LoggingCallback(BaseCallback):
 					query_cap = self.max_steps * self.action_chunk
 				for query_idx in range(query_cap):
 					if self.algorithm == 'dsrl_sac':
-						action, _ = agent.predict(obs, deterministic=deterministic)
+						action, _ = agent.predict(obs, deterministic=False)
 					elif self.algorithm == 'dsrl_na':
-						action, _ = agent.predict_diffused(obs, deterministic=deterministic)
+						action, _ = agent.predict_diffused(obs, deterministic=False)
 						self._set_pending_chunk_exec(env, agent)
 					next_obs, reward, done, info = env.step(action)
 					obs = next_obs
@@ -398,7 +393,6 @@ class LoggingCallback(BaseCallback):
 					done_i = np.logical_or(done_i, finished)
 					if (
 						self.algorithm == 'dsrl_na'
-						and not deterministic
 						and hasattr(agent, "get_last_eval_schedule")
 					):
 						schedule = agent.get_last_eval_schedule()
@@ -466,20 +460,13 @@ class LoggingCallback(BaseCallback):
 			avg_rew = rew_total / total_ep if total_ep > 0 else 0
 			if self.use_wandb:
 				name = 'eval'
-				if deterministic:
-					wandb.log({
-						f"{name}/success_rate_deterministic": success_rate,
-						f"{name}/reward_deterministic": avg_rew,
-					}, step=self.log_count)
-				else:
-					wandb.log({
-						f"{name}/success_rate": success_rate,
-						f"{name}/reward": avg_rew,
-						f"{name}/timesteps": self.total_timesteps,
-					}, step=self.log_count)
+				wandb.log({
+					f"{name}/success_rate": success_rate,
+					f"{name}/reward": avg_rew,
+					f"{name}/timesteps": self.total_timesteps,
+				}, step=self.log_count)
 			if (
 				self.algorithm == 'dsrl_na'
-				and not deterministic
 				and hasattr(agent, "stop_eval_tracking")
 				and hasattr(agent, "update_phase_from_eval")
 			):
@@ -550,7 +537,7 @@ class LoggingCallback(BaseCallback):
 							],
 						)
 					wandb.log(elastic_payload, step=self.log_count)
-			self._log_eval_video(agent, deterministic=deterministic)
+			self._log_eval_video(agent)
 
 	def set_timesteps(self, timesteps):
 		self.total_timesteps = timesteps

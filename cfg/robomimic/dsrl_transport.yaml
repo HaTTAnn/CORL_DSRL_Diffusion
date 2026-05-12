@@ -22,7 +22,6 @@ action_dim: 14
 cond_steps: 1
 act_steps: 8 # action chunk size of base policy
 load_offline_data: False
-deterministic_eval: False
 
 eval_interval: 8000
 num_evals: 200

@@ -22,7 +22,6 @@ action_dim: 7
 cond_steps: 1
 act_steps: 4 
 load_offline_data: False
-deterministic_eval: False
 
 eval_interval: 3000
 num_evals: 200
