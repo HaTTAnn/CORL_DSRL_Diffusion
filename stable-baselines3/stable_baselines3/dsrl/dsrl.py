@@ -1272,14 +1272,6 @@ class DSRL(OffPolicyAlgorithm):
 				return self.diffusion_policy(obs, noise_actions, return_numpy=False)
 			raise
 
-	def _grad_norm(self, parameters) -> float:
-		total = 0.0
-		for param in parameters:
-			if param.grad is None:
-				continue
-			total += float(param.grad.detach().pow(2).sum().item())
-		return float(total ** 0.5)
-
 	def _create_aliases(self) -> None:
 		self.actor = self.policy.actor
 		self.critic = self.policy.critic
@@ -1309,57 +1301,15 @@ class DSRL(OffPolicyAlgorithm):
 
 		ent_coef_losses, ent_coefs = [], []
 		actor_losses, critic_losses, noise_critic_losses = [], [], []
-		q_value_mean_batch: list[float] = []
-		q_value_std_batch: list[float] = []
-		target_q_value_mean_batch: list[float] = []
-		target_q_value_std_batch: list[float] = []
-		actor_q_value_mean_batch: list[float] = []
-		noise_q_value_mean_batch: list[float] = []
-		q_target_gap_mean_batch: list[float] = []
 		actor_compute_cost_batch: list[float] = []
-		difficulty_batch: list[float] = []
 		difficulty_abs_batch: list[float] = []
-		difficulty_min_batch: list[float] = []
-		difficulty_max_batch: list[float] = []
-		difficulty_prior_batch: list[float] = []
 		difficulty_prior_abs_batch: list[float] = []
-		difficulty_prior_min_batch: list[float] = []
-		difficulty_prior_max_batch: list[float] = []
-		difficulty_q_std_mean_batch: list[float] = []
-		difficulty_q_std_std_batch: list[float] = []
-		difficulty_q_std_min_batch: list[float] = []
-		difficulty_q_std_max_batch: list[float] = []
-		difficulty_source_mean_batch: list[float] = []
 		difficulty_source_std_batch: list[float] = []
-		difficulty_source_min_batch: list[float] = []
-		difficulty_source_max_batch: list[float] = []
 		difficulty_losses: list[float] = []
-		schedule_entropy_batch: list[float] = []
-		difficulty_loss_gates: list[float] = []
-		difficulty_margin_gates: list[float] = []
-		difficulty_combined_gates: list[float] = []
-		margin_floor_raw_gates: list[float] = []
-		margin_floor_after_gates: list[float] = []
-		range_loss_gates: list[float] = []
-		monotonic_inversion_rates: list[float] = []
 		schedule_gates: list[float] = []
 		prior_gates: list[float] = []
-		schedule_residual_scales: list[float] = []
-		schedule_residual_authorities: list[float] = []
-		macro_discount_batch: list[float] = []
-		replay_chunk_exec_batch: list[float] = []
-		replay_denoising_steps_batch: list[float] = []
-		grad_norm_actor_w: list[float] = []
-		grad_norm_actor_z_steps: list[float] = []
-		grad_norm_actor_z_chunk: list[float] = []
-		entropy_steps, entropy_chunk = [], []
-		denoise_steps_mean, denoise_steps_min, denoise_steps_max = [], [], []
-		chunk_size_mean, chunk_size_min, chunk_size_max = [], [], []
+		denoise_steps_mean, chunk_size_mean = [], []
 		denoise_steps_target_mean, chunk_size_target_mean = [], []
-		denoise_target_above_fixed_rate, denoise_target_below_fixed_rate = [], []
-		denoise_exec_above_fixed_rate, denoise_exec_below_fixed_rate = [], []
-		chunk_target_above_fixed_rate, chunk_target_below_fixed_rate = [], []
-		chunk_exec_above_fixed_rate, chunk_exec_below_fixed_rate = [], []
 		target_exec_mismatch_steps, target_exec_mismatch_chunk = [], []
 
 		if self.actor_gradient_steps < 0:
@@ -1388,8 +1338,6 @@ class DSRL(OffPolicyAlgorithm):
 			steps_actor, chunk_actor = steps_ctrl, chunk_ctrl
 			log_prob_sched = log_prob_steps + log_prob_chunk
 			log_prob = log_prob_w + log_prob_sched
-			entropy_steps.append((-log_prob_steps).mean().item())
-			entropy_chunk.append((-log_prob_chunk).mean().item())
 			if self.enable_three_head:
 				step_targets = self._map_control_to_float(steps_ctrl, self.min_denoising_steps, self.max_denoising_steps).to(dtype=th.float32)
 				chunk_targets = self._map_control_to_float(chunk_ctrl, self.min_chunk_size, self.max_chunk_size).to(dtype=th.float32)
@@ -1405,25 +1353,10 @@ class DSRL(OffPolicyAlgorithm):
 					self.max_chunk_size,
 					stochastic=self.stochastic_rounding,
 				).to(dtype=th.float32)
-				base_steps = th.as_tensor(float(self.fixed_denoising_steps), device=step_targets.device, dtype=step_targets.dtype)
-				base_chunk = th.as_tensor(float(self.fixed_chunk_size), device=chunk_targets.device, dtype=chunk_targets.dtype)
-				eps = 1e-6
 				denoise_steps_mean.append(step_vals.mean().item())
-				denoise_steps_min.append(step_vals.min().item())
-				denoise_steps_max.append(step_vals.max().item())
 				chunk_size_mean.append(chunk_vals.mean().item())
-				chunk_size_min.append(chunk_vals.min().item())
-				chunk_size_max.append(chunk_vals.max().item())
 				denoise_steps_target_mean.append(step_targets.mean().item())
 				chunk_size_target_mean.append(chunk_targets.mean().item())
-				denoise_target_above_fixed_rate.append((step_targets > base_steps + eps).float().mean().item())
-				denoise_target_below_fixed_rate.append((step_targets < base_steps - eps).float().mean().item())
-				denoise_exec_above_fixed_rate.append((step_vals > base_steps + eps).float().mean().item())
-				denoise_exec_below_fixed_rate.append((step_vals < base_steps - eps).float().mean().item())
-				chunk_target_above_fixed_rate.append((chunk_targets > base_chunk + eps).float().mean().item())
-				chunk_target_below_fixed_rate.append((chunk_targets < base_chunk - eps).float().mean().item())
-				chunk_exec_above_fixed_rate.append((chunk_vals > base_chunk + eps).float().mean().item())
-				chunk_exec_below_fixed_rate.append((chunk_vals < base_chunk - eps).float().mean().item())
 				target_exec_mismatch_steps.append((step_vals - step_targets).abs().mean().item())
 				target_exec_mismatch_chunk.append((chunk_vals - chunk_targets).abs().mean().item())
 
@@ -1479,10 +1412,6 @@ class DSRL(OffPolicyAlgorithm):
 				else:
 					chunk_exec = th.clamp(replay_data.chunk_exec.to(device=self.device, dtype=replay_data.rewards.dtype), min=1.0)
 				macro_discount = th.pow(th.full_like(chunk_exec, float(self.gamma)), chunk_exec)
-				macro_discount_batch.append(float(macro_discount.mean().item()))
-				replay_chunk_exec_batch.append(float(chunk_exec.mean().item()))
-				if getattr(replay_data, "denoising_steps", None) is not None:
-					replay_denoising_steps_batch.append(float(replay_data.denoising_steps.float().mean().item()))
 				target_q_values = replay_data.rewards + (1 - replay_data.dones) * macro_discount * next_q_values
 
 			# Get current Q-values estimates for each critic network using action from the replay buffer
@@ -1492,15 +1421,6 @@ class DSRL(OffPolicyAlgorithm):
 			critic_loss = 0.5 * sum(F.mse_loss(current_q, target_q_values) for current_q in current_q_values)
 			assert isinstance(critic_loss, th.Tensor)  # for type checker
 			critic_losses.append(critic_loss.item())  # type: ignore[union-attr]
-			with th.no_grad():
-				current_q_tensor = th.cat([current_q.detach() for current_q in current_q_values], dim=1)
-				target_q_detached = target_q_values.detach()
-				q_value_mean_batch.append(float(current_q_tensor.mean().item()))
-				q_value_std_batch.append(float(current_q_tensor.std(unbiased=False).item()))
-				target_q_value_mean_batch.append(float(target_q_detached.mean().item()))
-				target_q_value_std_batch.append(float(target_q_detached.std(unbiased=False).item()))
-				q_target_gap_mean_batch.append(float((current_q_tensor.mean(dim=1, keepdim=True) - target_q_detached).abs().mean().item()))
-
 			# Optimize the critic
 			self.critic.optimizer.zero_grad()
 			critic_loss.backward()
@@ -1516,9 +1436,6 @@ class DSRL(OffPolicyAlgorithm):
 					min_qf_pi, _ = th.min(q_values_pi, dim=1, keepdim=True)
 				elif self.critic_backup_combine_type == 'mean':
 					min_qf_pi = th.mean(q_values_pi, dim=1, keepdim=True)
-				with th.no_grad():
-					noise_q_value_mean_batch.append(float(q_values_pi.detach().mean().item()))
-					actor_q_value_mean_batch.append(float(min_qf_pi.detach().mean().item()))
 				actor_loss = (ent_coef * log_prob - min_qf_pi).mean()
 				if self.enable_three_head:
 					awc_cost = self._actor_compute_cost(steps_actor, chunk_actor).reshape(-1, 1)
@@ -1526,51 +1443,22 @@ class DSRL(OffPolicyAlgorithm):
 					difficulty = schedule_info.get("difficulty")
 					if difficulty is not None:
 						difficulty = difficulty.detach().to(device=steps_actor.device, dtype=steps_actor.dtype)
-						diff_loss, diff_logs = self._difficulty_alignment_loss(steps_actor, chunk_actor, difficulty)
+						diff_loss, _ = self._difficulty_alignment_loss(steps_actor, chunk_actor, difficulty)
 						if diff_loss.requires_grad or diff_loss.item() != 0.0:
 							actor_loss = actor_loss + diff_loss
 						difficulty_losses.append(float(diff_loss.detach().item()))
-						difficulty_detached = difficulty.detach()
-						difficulty_batch.append(float(difficulty_detached.mean().item()))
-						difficulty_abs_batch.append(float(difficulty_detached.abs().mean().item()))
-						difficulty_min_batch.append(float(difficulty_detached.min().item()))
-						difficulty_max_batch.append(float(difficulty_detached.max().item()))
-						difficulty_loss_gates.append(diff_logs.get("difficulty_loss_gate", 0.0))
-						difficulty_margin_gates.append(diff_logs.get("difficulty_margin_gate", 0.0))
-						difficulty_combined_gates.append(diff_logs.get("difficulty_combined_gate", 0.0))
-						margin_floor_raw_gates.append(diff_logs.get("margin_floor_gate_raw", 0.0))
-						margin_floor_after_gates.append(diff_logs.get("margin_floor_gate_after_range_success", 0.0))
-						range_loss_gates.append(diff_logs.get("range_loss_gate", 0.0))
-						monotonic_inversion_rates.append(diff_logs.get("monotonic_inversion_rate", 0.0))
+						difficulty_abs_batch.append(float(difficulty.detach().abs().mean().item()))
 					prior_u = schedule_info.get("difficulty_prior_u")
 					if prior_u is not None:
-						prior_u_detached = prior_u.detach()
-						difficulty_prior_batch.append(float(prior_u_detached.mean().item()))
-						difficulty_prior_abs_batch.append(float(prior_u_detached.abs().mean().item()))
-						difficulty_prior_min_batch.append(float(prior_u_detached.min().item()))
-						difficulty_prior_max_batch.append(float(prior_u_detached.max().item()))
-					q_std = schedule_info.get("q_std")
-					if q_std is not None:
-						q_std_detached = q_std.detach()
-						difficulty_q_std_mean_batch.append(float(q_std_detached.mean().item()))
-						difficulty_q_std_std_batch.append(float(q_std_detached.std(unbiased=False).item()))
-						difficulty_q_std_min_batch.append(float(q_std_detached.min().item()))
-						difficulty_q_std_max_batch.append(float(q_std_detached.max().item()))
+						difficulty_prior_abs_batch.append(float(prior_u.detach().abs().mean().item()))
 					source_score = schedule_info.get("difficulty_source_score")
 					if source_score is not None:
-						source_score_detached = source_score.detach()
-						difficulty_source_mean_batch.append(float(source_score_detached.mean().item()))
-						difficulty_source_std_batch.append(float(source_score_detached.std(unbiased=False).item()))
-						difficulty_source_min_batch.append(float(source_score_detached.min().item()))
-						difficulty_source_max_batch.append(float(source_score_detached.max().item()))
+						difficulty_source_std_batch.append(float(source_score.detach().std(unbiased=False).item()))
 					schedule_gates.append(float(schedule_info.get("schedule_gate", 0.0)))
 					prior_gates.append(float(schedule_info.get("difficulty_prior_gate", 0.0)))
-					schedule_residual_scales.append(float(schedule_info.get("active_schedule_residual_scale", 0.0)))
-					schedule_residual_authorities.append(float(schedule_info.get("schedule_residual_authority", 0.0)))
 					if self.schedule_entropy_weight > 0.0 and train_scheduling and self.schedule_control_mode != "prior_only":
 						schedule_entropy = -(log_prob_steps + log_prob_chunk).mean()
 						actor_loss = actor_loss - self.schedule_entropy_weight * schedule_entropy
-						schedule_entropy_batch.append(float(schedule_entropy.detach().item()))
 				actor_losses.append(actor_loss.item())
 
 				# Optimize the actor
@@ -1578,11 +1466,6 @@ class DSRL(OffPolicyAlgorithm):
 				if self.enable_three_head and self.schedule_head_optimizer is not None:
 					self.schedule_head_optimizer.zero_grad()
 				actor_loss.backward()
-				grad_norm_actor_w.append(self._grad_norm(self.actor.parameters()))
-				if self.enable_three_head and self.steps_mu is not None and self.steps_log_std is not None:
-					grad_norm_actor_z_steps.append(self._grad_norm(list(self.steps_mu.parameters()) + list(self.steps_log_std.parameters())))
-				if self.enable_three_head and self.chunk_mu is not None and self.chunk_log_std is not None:
-					grad_norm_actor_z_chunk.append(self._grad_norm(list(self.chunk_mu.parameters()) + list(self.chunk_log_std.parameters())))
 				self.actor.optimizer.step()
 				if self.enable_three_head and self.schedule_head_optimizer is not None and train_scheduling:
 					self.schedule_head_optimizer.step()
@@ -1611,149 +1494,36 @@ class DSRL(OffPolicyAlgorithm):
 		self.logger.record("train/actor_loss", np.mean(actor_losses))
 		self.logger.record("train/critic_loss", np.mean(critic_losses))
 		self.logger.record("train/noise_critic_loss", np.mean(noise_critic_losses))
-		if len(q_value_mean_batch) > 0:
-			self.logger.record("train/q_value_mean", np.mean(q_value_mean_batch))
-			self.logger.record("train/q_value_std", np.mean(q_value_std_batch))
-			self.logger.record("train/target_q_value_mean", np.mean(target_q_value_mean_batch))
-			self.logger.record("train/target_q_value_std", np.mean(target_q_value_std_batch))
-			self.logger.record("train/q_target_gap_mean", np.mean(q_target_gap_mean_batch))
-		if len(actor_q_value_mean_batch) > 0:
-			self.logger.record("train/actor_q_value_mean", np.mean(actor_q_value_mean_batch))
-			self.logger.record("train/noise_q_value_mean", np.mean(noise_q_value_mean_batch))
-		if len(macro_discount_batch) > 0:
-			self.logger.record("train/macro_discount_mean", np.mean(macro_discount_batch))
-			self.logger.record("train/replay_chunk_exec_mean", np.mean(replay_chunk_exec_batch))
-		if len(replay_denoising_steps_batch) > 0:
-			self.logger.record("train/replay_denoising_steps_mean", np.mean(replay_denoising_steps_batch))
 		if len(actor_compute_cost_batch) > 0:
 			self.logger.record("train/actor_compute_cost_mean", np.mean(actor_compute_cost_batch))
-		if len(difficulty_batch) > 0:
-			self.logger.record("train/difficulty_mean", np.mean(difficulty_batch))
-			self.logger.record("train/difficulty_abs_mean", np.mean(difficulty_abs_batch))
-			self.logger.record("train/difficulty_min", np.mean(difficulty_min_batch))
-			self.logger.record("train/difficulty_max", np.mean(difficulty_max_batch))
-		if len(difficulty_prior_batch) > 0:
-			self.logger.record("train/difficulty_prior_u_mean", np.mean(difficulty_prior_batch))
-			self.logger.record("train/difficulty_prior_u_abs_mean", np.mean(difficulty_prior_abs_batch))
-			self.logger.record("train/difficulty_prior_u_min", np.mean(difficulty_prior_min_batch))
-			self.logger.record("train/difficulty_prior_u_max", np.mean(difficulty_prior_max_batch))
-		if len(difficulty_q_std_mean_batch) > 0:
-			self.logger.record("train/difficulty_q_std_mean", np.mean(difficulty_q_std_mean_batch))
-			self.logger.record("train/difficulty_q_std_std", np.mean(difficulty_q_std_std_batch))
-			self.logger.record("train/difficulty_q_std_min", np.mean(difficulty_q_std_min_batch))
-			self.logger.record("train/difficulty_q_std_max", np.mean(difficulty_q_std_max_batch))
-		if len(difficulty_source_mean_batch) > 0:
-			self.logger.record("train/difficulty_source_score_mean", np.mean(difficulty_source_mean_batch))
-			self.logger.record("train/difficulty_source_score_std", np.mean(difficulty_source_std_batch))
-			self.logger.record("train/difficulty_source_score_min", np.mean(difficulty_source_min_batch))
-			self.logger.record("train/difficulty_source_score_max", np.mean(difficulty_source_max_batch))
-		if len(difficulty_losses) > 0:
-			self.logger.record("train/difficulty_loss", np.mean(difficulty_losses))
-		if len(schedule_entropy_batch) > 0:
-			self.logger.record("train/schedule_entropy", np.mean(schedule_entropy_batch))
-			self.logger.record("train/schedule_entropy_bonus", self.schedule_entropy_weight * np.mean(schedule_entropy_batch))
-		if self.enable_three_head and len(entropy_steps) > 0:
-			self.logger.record("train/entropy_steps", np.mean(entropy_steps))
-			self.logger.record("train/entropy_chunk", np.mean(entropy_chunk))
+		if self.enable_three_head and len(denoise_steps_mean) > 0:
 			self.logger.record("train/denoising_steps_mean", np.mean(denoise_steps_mean))
-			self.logger.record("train/denoising_steps_min", np.mean(denoise_steps_min))
-			self.logger.record("train/denoising_steps_max", np.mean(denoise_steps_max))
 			self.logger.record("train/chunk_size_mean", np.mean(chunk_size_mean))
-			self.logger.record("train/chunk_size_min", np.mean(chunk_size_min))
-			self.logger.record("train/chunk_size_max", np.mean(chunk_size_max))
 			self.logger.record("train/denoising_steps_target_mean", np.mean(denoise_steps_target_mean))
 			self.logger.record("train/chunk_size_target_mean", np.mean(chunk_size_target_mean))
-			self.logger.record("train/denoising_target_above_fixed_rate", np.mean(denoise_target_above_fixed_rate))
-			self.logger.record("train/denoising_target_below_fixed_rate", np.mean(denoise_target_below_fixed_rate))
-			self.logger.record("train/denoising_exec_above_fixed_rate", np.mean(denoise_exec_above_fixed_rate))
-			self.logger.record("train/denoising_exec_below_fixed_rate", np.mean(denoise_exec_below_fixed_rate))
-			self.logger.record("train/chunk_target_above_fixed_rate", np.mean(chunk_target_above_fixed_rate))
-			self.logger.record("train/chunk_target_below_fixed_rate", np.mean(chunk_target_below_fixed_rate))
-			self.logger.record("train/chunk_exec_above_fixed_rate", np.mean(chunk_exec_above_fixed_rate))
-			self.logger.record("train/chunk_exec_below_fixed_rate", np.mean(chunk_exec_below_fixed_rate))
 			self.logger.record("train/target_exec_mismatch_steps", np.mean(target_exec_mismatch_steps))
 			self.logger.record("train/target_exec_mismatch_chunk", np.mean(target_exec_mismatch_chunk))
-			self.logger.record("train/scheduling_active", float(train_scheduling))
-			self.logger.record("train/schedule_control_mode_id", self._mode_id())
 			if len(schedule_gates) > 0:
-				mean_schedule_gate = float(np.mean(schedule_gates))
-				residual_scale = float(np.mean(schedule_residual_scales)) if len(schedule_residual_scales) > 0 else 0.0
-				if self.schedule_control_mode != "prior_residual":
-					residual_scale = 0.0
-				self.logger.record("train/schedule_gate", mean_schedule_gate)
-				self.logger.record("train/preprior_residual_scale", self.preprior_residual_scale)
-				self.logger.record("train/schedule_residual_scale", self.schedule_residual_scale)
-				self.logger.record("train/active_schedule_residual_scale", residual_scale)
-				self.logger.record("train/effective_schedule_residual_scale", residual_scale * mean_schedule_gate)
-			if len(schedule_residual_authorities) > 0:
-				self.logger.record("train/schedule_residual_authority", float(np.mean(schedule_residual_authorities)))
+				self.logger.record("train/schedule_gate", float(np.mean(schedule_gates)))
 			if len(prior_gates) > 0:
-				mean_prior_gate = float(np.mean(prior_gates))
-				self.logger.record("train/difficulty_prior_gate", mean_prior_gate)
-				self.logger.record("train/effective_difficulty_prior_scale", self.difficulty_prior_scale * mean_prior_gate)
-			if len(difficulty_loss_gates) > 0:
-				self.logger.record("train/difficulty_loss_gate", np.mean(difficulty_loss_gates))
-			if len(difficulty_margin_gates) > 0:
-				self.logger.record("train/difficulty_margin_gate", np.mean(difficulty_margin_gates))
-			if len(difficulty_combined_gates) > 0:
-				self.logger.record("train/difficulty_combined_gate", np.mean(difficulty_combined_gates))
-			if len(margin_floor_raw_gates) > 0:
-				self.logger.record("train/margin_floor_gate_raw", np.mean(margin_floor_raw_gates))
-			if len(margin_floor_after_gates) > 0:
-				self.logger.record("train/margin_floor_gate_after_range_success", np.mean(margin_floor_after_gates))
-			if len(range_loss_gates) > 0:
-				self.logger.record("train/range_loss_gate", np.mean(range_loss_gates))
-			if len(monotonic_inversion_rates) > 0:
-				self.logger.record("train/monotonic_inversion_rate", np.mean(monotonic_inversion_rates))
-			if len(grad_norm_actor_w) > 0:
-				self.logger.record("train/grad_norm_actor_w", np.mean(grad_norm_actor_w))
-			if len(grad_norm_actor_z_steps) > 0:
-				self.logger.record("train/grad_norm_actor_z_steps", np.mean(grad_norm_actor_z_steps))
-			if len(grad_norm_actor_z_chunk) > 0:
-				self.logger.record("train/grad_norm_actor_z_chunk", np.mean(grad_norm_actor_z_chunk))
-		self.logger.record("train/enable_chunk_elasticity", float(self.enable_chunk_elasticity))
+				self.logger.record("train/effective_difficulty_prior_scale", self.difficulty_prior_scale * float(np.mean(prior_gates)))
+		if len(difficulty_abs_batch) > 0:
+			self.logger.record("train/difficulty_abs_mean", np.mean(difficulty_abs_batch))
+		if len(difficulty_prior_abs_batch) > 0:
+			self.logger.record("train/difficulty_prior_u_abs_mean", np.mean(difficulty_prior_abs_batch))
+		if len(difficulty_source_std_batch) > 0:
+			self.logger.record("train/difficulty_source_score_std", np.mean(difficulty_source_std_batch))
+		if len(difficulty_losses) > 0:
+			self.logger.record("train/difficulty_loss", np.mean(difficulty_losses))
 		gate_snapshot = self._gate_snapshot()
 		self.logger.record("train/range_alpha", gate_snapshot["range_alpha"])
-		self.logger.record("train/range_step_progress", gate_snapshot["range_step_progress"])
-		self.logger.record("train/range_success_mix", gate_snapshot["range_success_mix"])
-		self.logger.record("train/range_success_gate_raw", gate_snapshot["range_success_gate_raw"])
-		self.logger.record("train/range_success_ema", gate_snapshot["range_success_ema"])
-		self.logger.record("train/range_success_ema_beta", gate_snapshot["range_success_ema_beta"])
-		self.logger.record("train/range_success_no_close", gate_snapshot["range_success_no_close"])
-		self.logger.record("train/range_actuator_floor", gate_snapshot["range_actuator_floor"])
-		self.logger.record("train/range_actuator_gate", gate_snapshot["range_actuator_gate"])
-		self.logger.record("train/gate_timesteps", gate_snapshot["gate_timesteps"])
-		self.logger.record("train/sb3_num_timesteps", float(self.num_timesteps))
-		self.logger.record("train/difficulty_success_gate_raw", gate_snapshot["difficulty_success_gate_raw"])
 		self.logger.record("train/difficulty_success_mix", gate_snapshot["difficulty_success_mix"])
-		self.logger.record("train/difficulty_success_ema", gate_snapshot["difficulty_success_ema"])
-		self.logger.record("train/difficulty_success_ema_beta", gate_snapshot["difficulty_success_ema_beta"])
-		self.logger.record("train/difficulty_success_open_rate", gate_snapshot["difficulty_success_open_rate"])
-		self.logger.record("train/difficulty_success_close_rate", gate_snapshot["difficulty_success_close_rate"])
-		self.logger.record("train/difficulty_success_no_close", gate_snapshot["difficulty_success_no_close"])
-		self.logger.record("train/difficulty_step_gate", gate_snapshot["difficulty_step_gate"])
-		self.logger.record("train/difficulty_external_gate", gate_snapshot["difficulty_external_gate"])
-		self.logger.record("train/success_for_range_gate", gate_snapshot["range_success_ema"])
-		self.logger.record("train/success_for_difficulty_gate", gate_snapshot["difficulty_success_ema"])
-		self.logger.record("train/cost_gate_mode", gate_snapshot["cost_gate_mode"])
-		self.logger.record("train/cost_progress", gate_snapshot["cost_progress"])
-		self.logger.record("train/cost_success_gate_raw", gate_snapshot["cost_success_gate_raw"])
-		self.logger.record("train/cost_success_mix", gate_snapshot["cost_success_mix"])
-		self.logger.record("train/actor_compute_lambda_warmup", gate_snapshot["actor_compute_lambda_warmup"])
-		self.logger.record("train/actor_compute_lambda_target", gate_snapshot["actor_compute_lambda_target"])
 		self.logger.record("train/actor_compute_lambda_active", gate_snapshot["actor_compute_lambda_active"])
-		self.logger.record("train/nfe_saving_weight", self.nfe_saving_weight)
-		self.logger.record("train/rollout_nfe_penalty_coef", self._rollout_nfe_penalty_coef())
-		self.logger.record("train/gate_monotonic_violation_count", gate_snapshot["gate_monotonic_violation_count"])
+		self.logger.record("train/gate_timesteps", gate_snapshot["gate_timesteps"])
 		if len(self._episode_budget_ratios) > 0:
 			ratios = np.asarray(self._episode_budget_ratios, dtype=np.float32)
 			self.logger.record("train/episode_budget_ratio", float(np.mean(ratios)))
-			self.logger.record("train/episode_budget_under", float(np.mean(self._episode_budget_unders)))
-			self.logger.record("train/episode_budget_over", float(np.mean(self._episode_budget_overs)))
 			self.logger.record("train/episode_budget_penalty", float(np.mean(self._episode_budget_penalty_totals)))
-			self.logger.record("train/episode_budget_gross_penalty", float(np.mean(self._episode_budget_gross_penalties)))
-			self.logger.record("train/episode_budget_saving", float(np.mean(self._episode_budget_savings)))
-			self.logger.record("train/episode_budget_saving_bonus", float(np.mean(self._episode_budget_saving_bonuses)))
 			self.logger.record("train/episode_budget_success_rate", float(np.mean(self._episode_budget_successes)))
 			self.logger.record("train/episode_budget_saving_active_rate", float(np.mean(self._episode_budget_saving_active)))
 			self._episode_budget_ratios = []
