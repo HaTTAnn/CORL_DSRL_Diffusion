@@ -99,6 +99,102 @@ class LoggingCallback(BaseCallback):
 		self._eval_video_calls = 0
 		self._eval_video_warned = False
 
+	def _finite_array(self, values):
+		arr = np.asarray(values, dtype=np.float32).reshape(-1)
+		return arr[np.isfinite(arr)]
+
+	def _safe_mean(self, values):
+		arr = self._finite_array(values)
+		return float(np.mean(arr)) if arr.size > 0 else 0.0
+
+	def _safe_std(self, values):
+		arr = self._finite_array(values)
+		return float(np.std(arr)) if arr.size > 0 else 0.0
+
+	def _safe_percentile(self, values, percentile):
+		arr = self._finite_array(values)
+		return float(np.percentile(arr, percentile)) if arr.size > 0 else 0.0
+
+	def _safe_min(self, values):
+		arr = self._finite_array(values)
+		return float(np.min(arr)) if arr.size > 0 else 0.0
+
+	def _safe_max(self, values):
+		arr = self._finite_array(values)
+		return float(np.max(arr)) if arr.size > 0 else 0.0
+
+	def _safe_ratio(self, numerator, denominator):
+		denominator = float(denominator)
+		if abs(denominator) < 1e-8:
+			return 0.0
+		return float(numerator) / denominator
+
+	def _rankdata_average(self, values):
+		arr = self._finite_array(values)
+		ranks = np.zeros(arr.shape[0], dtype=np.float32)
+		if arr.size == 0:
+			return ranks
+		order = np.argsort(arr, kind="mergesort")
+		sorted_arr = arr[order]
+		start = 0
+		while start < arr.size:
+			end = start + 1
+			while end < arr.size and sorted_arr[end] == sorted_arr[start]:
+				end += 1
+			ranks[order[start:end]] = 0.5 * (start + end - 1) + 1.0
+			start = end
+		return ranks
+
+	def _safe_corr(self, x_values, y_values, spearman=False):
+		x = self._finite_array(x_values)
+		y = self._finite_array(y_values)
+		n = min(x.size, y.size)
+		if n < 2:
+			return 0.0
+		x = x[:n]
+		y = y[:n]
+		if spearman:
+			x = self._rankdata_average(x)
+			y = self._rankdata_average(y)
+		if float(np.std(x)) < 1e-8 or float(np.std(y)) < 1e-8:
+			return 0.0
+		return float(np.corrcoef(x, y)[0, 1])
+
+	def _add_distribution_metrics(self, metrics, prefix, values):
+		arr = self._finite_array(values)
+		metrics[f"{prefix}_mean"] = self._safe_mean(arr)
+		metrics[f"{prefix}_std"] = self._safe_std(arr)
+		metrics[f"{prefix}_min"] = self._safe_min(arr)
+		metrics[f"{prefix}_p05"] = self._safe_percentile(arr, 5)
+		metrics[f"{prefix}_p50"] = self._safe_percentile(arr, 50)
+		metrics[f"{prefix}_p95"] = self._safe_percentile(arr, 95)
+		metrics[f"{prefix}_max"] = self._safe_max(arr)
+		metrics[f"{prefix}_cv"] = self._safe_ratio(np.std(arr), np.mean(arr)) if arr.size > 0 else 0.0
+
+	def _budget_band_metrics(self, metrics, prefix, values, target, lower, upper):
+		arr = self._finite_array(values)
+		if arr.size == 0:
+			metrics[f"{prefix}_hit_rate"] = 0.0
+			metrics[f"{prefix}_under_rate"] = 0.0
+			metrics[f"{prefix}_over_rate"] = 0.0
+			metrics[f"{prefix}_mean_abs_target_error"] = 0.0
+			metrics[f"{prefix}_mean_band_violation"] = 0.0
+			return
+		metrics[f"{prefix}_hit_rate"] = float(np.mean((arr >= lower) & (arr <= upper)))
+		metrics[f"{prefix}_under_rate"] = float(np.mean(arr < lower))
+		metrics[f"{prefix}_over_rate"] = float(np.mean(arr > upper))
+		metrics[f"{prefix}_mean_abs_target_error"] = float(np.mean(np.abs(arr - target)))
+		metrics[f"{prefix}_mean_band_violation"] = float(np.mean(np.maximum(lower - arr, 0.0) + np.maximum(arr - upper, 0.0)))
+
+	def _build_eval_summary_table(self, metrics):
+		rows = []
+		for key in sorted(metrics.keys()):
+			value = metrics[key]
+			if isinstance(value, (int, float, np.integer, np.floating)):
+				category = key.split("_", 1)[0]
+				rows.append([category, key, float(value)])
+		return wandb.Table(data=rows, columns=["category", "metric", "value"])
+
 	def _set_pending_chunk_exec(self, env, agent):
 		if self.algorithm != 'dsrl_na' or not hasattr(agent, "get_last_predict_chunk_exec"):
 			return
@@ -350,8 +446,23 @@ class LoggingCallback(BaseCallback):
 			eval_steps_sum = 0.0
 			eval_chunk_requested_sum = 0.0
 			eval_chunk_exec_sum = 0.0
+			eval_steps_values = []
+			eval_steps_target_values = []
 			eval_chunk_requested_values = []
 			eval_chunk_exec_values = []
+			eval_chunk_target_values = []
+			eval_requested_nfe_values = []
+			eval_executed_nfe_values = []
+			eval_difficulty_values = []
+			eval_prior_u_values = []
+			eval_query_idx_values = []
+			eval_episode_success_values = []
+			eval_episode_steps = []
+			eval_episode_chunk_requested = []
+			eval_episode_chunk_exec = []
+			eval_episode_requested_nfe = []
+			eval_episode_executed_nfe = []
+			eval_episode_query_counts = []
 			query_steps = {}
 			query_steps_target = {}
 			query_chunk_requested = {}
@@ -369,6 +480,10 @@ class LoggingCallback(BaseCallback):
 				done_i = np.zeros(obs.shape[0], dtype=bool)
 				env_step_i = np.zeros(obs.shape[0], dtype=np.int32)
 				rew_ep_i = np.zeros(obs.shape[0])
+				episode_steps_i = np.zeros(obs.shape[0], dtype=np.float32)
+				episode_chunk_requested_i = np.zeros(obs.shape[0], dtype=np.float32)
+				episode_chunk_exec_i = np.zeros(obs.shape[0], dtype=np.float32)
+				episode_query_count_i = np.zeros(obs.shape[0], dtype=np.float32)
 				query_cap = self.max_steps
 				if self.algorithm == 'dsrl_na' and self.max_steps > 0:
 					query_cap = self.max_steps * self.action_chunk
@@ -421,11 +536,29 @@ class LoggingCallback(BaseCallback):
 								steps_a = steps_n[active_n]
 								chunk_req_a = chunk_req_n[active_n]
 								chunk_exec_a = np.maximum(chunk_exec_n[active_n], 1.0)
+								step_target_a = steps_target_n[active_n]
+								chunk_target_a = chunk_target_n[active_n]
+								difficulty_a = difficulty_n[active_n]
+								prior_u_a = prior_u_n[active_n]
+								req_nfe_a = steps_a / np.maximum(chunk_req_a, 1.0)
+								exec_nfe_a = steps_a / np.maximum(chunk_exec_a, 1.0)
 								eval_steps_sum += float(np.sum(steps_a))
 								eval_chunk_requested_sum += float(np.sum(chunk_req_a))
 								eval_chunk_exec_sum += float(np.sum(chunk_exec_a))
+								episode_steps_i[:n] += np.where(active_n, steps_n, 0.0)
+								episode_chunk_requested_i[:n] += np.where(active_n, chunk_req_n, 0.0)
+								episode_chunk_exec_i[:n] += np.where(active_n, np.maximum(chunk_exec_n, 1.0), 0.0)
+								episode_query_count_i[:n] += active_n.astype(np.float32)
+								eval_steps_values.extend(steps_a.tolist())
+								eval_steps_target_values.extend(step_target_a.tolist())
 								eval_chunk_requested_values.extend(chunk_req_a.tolist())
 								eval_chunk_exec_values.extend(chunk_exec_a.tolist())
+								eval_chunk_target_values.extend(chunk_target_a.tolist())
+								eval_requested_nfe_values.extend(req_nfe_a.tolist())
+								eval_executed_nfe_values.extend(exec_nfe_a.tolist())
+								eval_difficulty_values.extend(difficulty_a.tolist())
+								eval_prior_u_values.extend(prior_u_a.tolist())
+								eval_query_idx_values.extend([float(query_idx)] * int(np.sum(active_n)))
 								for env_idx in np.flatnonzero(active_n):
 									step_v = float(steps_n[env_idx])
 									step_target_v = float(steps_target_n[env_idx])
@@ -454,16 +587,33 @@ class LoggingCallback(BaseCallback):
 							env_step_i[:n] = np.where(active_n, step_end_n, env_step_i[:n])
 					if np.all(done_i):
 						break
+				episode_requested_nfe_i = episode_steps_i / np.maximum(episode_chunk_requested_i, 1.0)
+				episode_executed_nfe_i = episode_steps_i / np.maximum(episode_chunk_exec_i, 1.0)
+				eval_episode_success_values.extend(success_i.tolist())
+				eval_episode_steps.extend(episode_steps_i.tolist())
+				eval_episode_chunk_requested.extend(episode_chunk_requested_i.tolist())
+				eval_episode_chunk_exec.extend(episode_chunk_exec_i.tolist())
+				eval_episode_requested_nfe.extend(episode_requested_nfe_i.tolist())
+				eval_episode_executed_nfe.extend(episode_executed_nfe_i.tolist())
+				eval_episode_query_counts.extend(episode_query_count_i.tolist())
 				success.append(success_i.mean())
 				print(f'eval episode {i} at timestep {self.total_timesteps}')
 			success_rate = np.mean(success)
 			avg_rew = rew_total / total_ep if total_ep > 0 else 0
+			eval_rollout_count = len(eval_episode_success_values)
+			eval_success_count = float(np.sum(eval_episode_success_values)) if eval_rollout_count > 0 else 0.0
 			if self.use_wandb:
 				name = 'eval'
 				wandb.log({
 					f"{name}/success_rate": success_rate,
 					f"{name}/reward": avg_rew,
 					f"{name}/timesteps": self.total_timesteps,
+					"eval_table/core_success_rate": success_rate,
+					"eval_table/core_reward_mean": avg_rew,
+					"eval_table/core_timesteps": float(self.total_timesteps),
+					"eval_table/core_eval_rollouts": float(eval_rollout_count),
+					"eval_table/core_success_count": eval_success_count,
+					"eval_table/core_failure_count": max(float(eval_rollout_count) - eval_success_count, 0.0),
 				}, step=self.log_count)
 			if (
 				self.algorithm == 'dsrl_na'
@@ -475,6 +625,85 @@ class LoggingCallback(BaseCallback):
 				executed_nfe = eval_steps_sum / max(eval_chunk_exec_sum, 1.0)
 				agent.update_phase_from_eval(success_rate=success_rate, avg_nfe=executed_nfe)
 				if self.use_wandb:
+					fixed_steps = float(getattr(agent, "fixed_denoising_steps", 0.0))
+					fixed_chunk = float(max(getattr(agent, "fixed_chunk_size", 1.0), 1.0))
+					fixed_nfe = fixed_steps / fixed_chunk if fixed_steps > 0.0 else 0.0
+					target_nfe = float(getattr(agent, "target_nfe", executed_nfe))
+					nfe_target_lower = float(getattr(agent, "nfe_target_lower", target_nfe))
+					nfe_target_upper = float(getattr(agent, "nfe_target_upper", target_nfe))
+					min_steps = float(getattr(agent, "min_denoising_steps", 0.0))
+					max_steps = float(getattr(agent, "max_denoising_steps", 0.0))
+					min_chunk = float(max(getattr(agent, "min_chunk_size", 1.0), 1.0))
+					max_chunk = float(max(getattr(agent, "max_chunk_size", 1.0), 1.0))
+					episode_query_arr = self._finite_array(eval_episode_query_counts)
+					valid_episode_mask = episode_query_arr > 0.0
+					episode_requested_nfe_arr = self._finite_array(eval_episode_requested_nfe)
+					episode_executed_nfe_arr = self._finite_array(eval_episode_executed_nfe)
+					if episode_requested_nfe_arr.size == valid_episode_mask.size:
+						episode_requested_nfe_arr = episode_requested_nfe_arr[valid_episode_mask]
+					if episode_executed_nfe_arr.size == valid_episode_mask.size:
+						episode_executed_nfe_arr = episode_executed_nfe_arr[valid_episode_mask]
+					eval_table_metrics = {
+						"core_success_rate": float(success_rate),
+						"core_reward_mean": float(avg_rew),
+						"core_timesteps": float(self.total_timesteps),
+						"core_eval_rollouts": float(eval_rollout_count),
+						"core_success_count": float(eval_success_count),
+						"core_failure_count": max(float(eval_rollout_count) - float(eval_success_count), 0.0),
+						"cost_total_queries": float(len(eval_steps_values)),
+						"cost_total_denoising_steps": float(eval_steps_sum),
+						"cost_total_requested_actions": float(eval_chunk_requested_sum),
+						"cost_total_executed_actions": float(eval_chunk_exec_sum),
+						"cost_amortized_nfe_requested": float(requested_nfe),
+						"cost_amortized_nfe_executed": float(executed_nfe),
+						"cost_mean_query_nfe_requested": self._safe_mean(eval_requested_nfe_values),
+						"cost_mean_query_nfe_executed": self._safe_mean(eval_executed_nfe_values),
+						"cost_nfe_per_success": self._safe_ratio(eval_steps_sum, eval_success_count),
+						"cost_successes_per_1k_nfe": self._safe_ratio(1000.0 * eval_success_count, eval_steps_sum),
+						"cost_success_rate_per_nfe": self._safe_ratio(success_rate, executed_nfe),
+						"cost_denoising_steps_per_rollout": self._safe_ratio(eval_steps_sum, eval_rollout_count),
+						"cost_executed_actions_per_rollout": self._safe_ratio(eval_chunk_exec_sum, eval_rollout_count),
+						"cost_queries_per_rollout": self._safe_mean(eval_episode_query_counts),
+						"fixed_denoising_steps": fixed_steps,
+						"fixed_chunk_size": fixed_chunk,
+						"fixed_nfe": fixed_nfe,
+						"fixed_compute_saving_vs_fixed_executed": 1.0 - self._safe_ratio(executed_nfe, fixed_nfe) if fixed_nfe > 0.0 else 0.0,
+						"fixed_compute_saving_vs_fixed_requested": 1.0 - self._safe_ratio(requested_nfe, fixed_nfe) if fixed_nfe > 0.0 else 0.0,
+						"range_min_possible_nfe": min_steps / max_chunk if max_chunk > 0.0 else 0.0,
+						"range_max_possible_nfe": max_steps / min_chunk if min_chunk > 0.0 else 0.0,
+						"budget_target_nfe": target_nfe,
+						"budget_lower_nfe": nfe_target_lower,
+						"budget_upper_nfe": nfe_target_upper,
+						"control_steps_target_exec_mae": self._safe_mean(np.abs(self._finite_array(eval_steps_values) - self._finite_array(eval_steps_target_values))) if len(eval_steps_values) == len(eval_steps_target_values) and len(eval_steps_values) > 0 else 0.0,
+						"control_chunk_target_requested_mae": self._safe_mean(np.abs(self._finite_array(eval_chunk_requested_values) - self._finite_array(eval_chunk_target_values))) if len(eval_chunk_requested_values) == len(eval_chunk_target_values) and len(eval_chunk_requested_values) > 0 else 0.0,
+						"control_chunk_target_executed_mae": self._safe_mean(np.abs(self._finite_array(eval_chunk_exec_values) - self._finite_array(eval_chunk_target_values))) if len(eval_chunk_exec_values) == len(eval_chunk_target_values) and len(eval_chunk_exec_values) > 0 else 0.0,
+						"control_chunk_request_exec_mae": self._safe_mean(np.abs(self._finite_array(eval_chunk_exec_values) - self._finite_array(eval_chunk_requested_values))) if len(eval_chunk_exec_values) == len(eval_chunk_requested_values) and len(eval_chunk_exec_values) > 0 else 0.0,
+						"control_chunk_truncation_rate": float(np.mean(self._finite_array(eval_chunk_exec_values) < self._finite_array(eval_chunk_requested_values))) if len(eval_chunk_exec_values) == len(eval_chunk_requested_values) and len(eval_chunk_exec_values) > 0 else 0.0,
+						"adapt_spearman_difficulty_nfe_executed": self._safe_corr(eval_difficulty_values, eval_executed_nfe_values, spearman=True),
+						"adapt_spearman_difficulty_steps": self._safe_corr(eval_difficulty_values, eval_steps_values, spearman=True),
+						"adapt_spearman_difficulty_chunk_requested": self._safe_corr(eval_difficulty_values, eval_chunk_requested_values, spearman=True),
+						"adapt_spearman_difficulty_chunk_executed": self._safe_corr(eval_difficulty_values, eval_chunk_exec_values, spearman=True),
+						"adapt_pearson_difficulty_nfe_executed": self._safe_corr(eval_difficulty_values, eval_executed_nfe_values, spearman=False),
+						"adapt_spearman_prior_nfe_executed": self._safe_corr(eval_prior_u_values, eval_executed_nfe_values, spearman=True),
+						"adapt_spearman_query_idx_nfe_executed": self._safe_corr(eval_query_idx_values, eval_executed_nfe_values, spearman=True),
+					}
+					query_idx_arr = self._finite_array(eval_query_idx_values)
+					query_nfe_arr = self._finite_array(eval_executed_nfe_values)
+					if query_idx_arr.size == query_nfe_arr.size and query_idx_arr.size > 0:
+						early_mask = query_idx_arr <= np.percentile(query_idx_arr, 25)
+						late_mask = query_idx_arr >= np.percentile(query_idx_arr, 75)
+						eval_table_metrics["adapt_early_query_nfe_executed"] = self._safe_mean(query_nfe_arr[early_mask])
+						eval_table_metrics["adapt_late_query_nfe_executed"] = self._safe_mean(query_nfe_arr[late_mask])
+						eval_table_metrics["adapt_late_minus_early_nfe_executed"] = eval_table_metrics["adapt_late_query_nfe_executed"] - eval_table_metrics["adapt_early_query_nfe_executed"]
+					self._budget_band_metrics(eval_table_metrics, "budget_requested_episode", episode_requested_nfe_arr, target_nfe, nfe_target_lower, nfe_target_upper)
+					self._budget_band_metrics(eval_table_metrics, "budget_executed_episode", episode_executed_nfe_arr, target_nfe, nfe_target_lower, nfe_target_upper)
+					self._add_distribution_metrics(eval_table_metrics, "dist_steps", eval_steps_values)
+					self._add_distribution_metrics(eval_table_metrics, "dist_steps_target", eval_steps_target_values)
+					self._add_distribution_metrics(eval_table_metrics, "dist_chunk_requested", eval_chunk_requested_values)
+					self._add_distribution_metrics(eval_table_metrics, "dist_chunk_executed", eval_chunk_exec_values)
+					self._add_distribution_metrics(eval_table_metrics, "dist_nfe_requested", eval_requested_nfe_values)
+					self._add_distribution_metrics(eval_table_metrics, "dist_nfe_executed", eval_executed_nfe_values)
+					self._add_distribution_metrics(eval_table_metrics, "dist_episode_nfe_executed", episode_executed_nfe_arr)
 					elastic_payload = {
 						"eval/avg_denoising_steps": elastic_stats.get("avg_steps", 0.0),
 						"eval/avg_chunk_size": elastic_stats.get("avg_chunk", 0.0),
@@ -489,6 +718,12 @@ class LoggingCallback(BaseCallback):
 						"evaluation/chunk_requested_mean": float(np.mean(eval_chunk_requested_values)) if len(eval_chunk_requested_values) > 0 else 0.0,
 						"evaluation/chunk_exec_mean": float(np.mean(eval_chunk_exec_values)) if len(eval_chunk_exec_values) > 0 else 0.0,
 					}
+					elastic_payload.update({
+						f"eval_table/{key}": value
+						for key, value in eval_table_metrics.items()
+						if isinstance(value, (int, float, np.integer, np.floating))
+					})
+					elastic_payload["eval_table/summary"] = self._build_eval_summary_table(eval_table_metrics)
 					query_idx_keys = sorted(query_steps.keys())
 					if query_idx_keys:
 						def _query_mean(bucket, q_idx):
@@ -520,12 +755,15 @@ class LoggingCallback(BaseCallback):
 							],
 						)
 						elastic_payload["eval/query_idx_schedule_table"] = query_idx_schedule_table
+						elastic_payload["eval_table/query_idx_schedule_table"] = query_idx_schedule_table
 						elastic_payload["eval/query_idx_steps_exec"] = wandb.plot.line(query_idx_schedule_table, "query_idx", "steps_exec_mean", title="Denoising Steps by Query Index")
 						elastic_payload["eval/query_idx_chunk_requested"] = wandb.plot.line(query_idx_schedule_table, "query_idx", "chunk_requested_mean", title="Requested Chunk by Query Index")
 						elastic_payload["eval/query_idx_requested_nfe"] = wandb.plot.line(query_idx_schedule_table, "query_idx", "requested_nfe_mean", title="Requested NFE by Query Index")
 						elastic_payload["eval/query_idx_executed_nfe"] = wandb.plot.line(query_idx_schedule_table, "query_idx", "executed_nfe_mean", title="Executed NFE by Query Index")
 						elastic_payload["eval/query_idx_difficulty"] = wandb.plot.line(query_idx_schedule_table, "query_idx", "difficulty_mean", title="Difficulty by Query Index")
 						elastic_payload["eval/query_idx_difficulty_abs"] = wandb.plot.line(query_idx_schedule_table, "query_idx", "difficulty_abs_mean", title="Difficulty Magnitude by Query Index")
+						elastic_payload["eval_table/query_idx_executed_nfe"] = wandb.plot.line(query_idx_schedule_table, "query_idx", "executed_nfe_mean", title="Executed NFE by Query Index")
+						elastic_payload["eval_table/query_idx_difficulty_abs"] = wandb.plot.line(query_idx_schedule_table, "query_idx", "difficulty_abs_mean", title="Difficulty Magnitude by Query Index")
 					if query_schedule_rows:
 						elastic_payload["eval/query_schedule_table"] = wandb.Table(
 							data=query_schedule_rows,
