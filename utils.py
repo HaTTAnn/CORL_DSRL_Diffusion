@@ -343,209 +343,214 @@ class LoggingCallback(BaseCallback):
 		return True
 	
 	def evaluate(self, agent, deterministic=False):
-		if self.eval_episodes > 0:
-			env = self.eval_env
-			with torch.no_grad():
-				if self.algorithm == 'dsrl_na' and (not deterministic) and hasattr(agent, "start_eval_tracking"):
-					agent.start_eval_tracking()
-				success, rews = [], []
-				rew_total, total_ep = 0, 0
-				eval_steps_sum = 0.0
-				eval_chunk_requested_sum = 0.0
-				eval_chunk_exec_sum = 0.0
-				eval_chunk_requested_values = []
-				eval_chunk_exec_values = []
-				query_idx_requested_nfe = {}
-				query_idx_executed_nfe = {}
-				query_idx_chunk_requested = {}
-				query_idx_chunk_exec = {}
-				query_idx_denoising_steps = {}
-				query_idx_difficulty = {}
-				rew_ep = np.zeros(self.num_eval_env)
-				for i in range(self.eval_episodes):
-					obs = env.reset()
-					success_i = np.zeros(obs.shape[0])
-					done_i = np.zeros(obs.shape[0], dtype=bool)
-					rew_ep_i = np.zeros(obs.shape[0])
-					r = []
-					query_cap = self.max_steps
-					if self.algorithm == 'dsrl_na' and self.max_steps > 0:
-						query_cap = self.max_steps * self.action_chunk
-					for query_idx in range(query_cap):
-						if self.algorithm == 'dsrl_sac':
-							action, _ = agent.predict(obs, deterministic=deterministic)
-						elif self.algorithm == 'dsrl_na':
-							action, _ = agent.predict_diffused(obs, deterministic=deterministic)
-							self._set_pending_chunk_exec(env, agent)
-						next_obs, reward, done, info = env.step(action)
-						obs = next_obs
-						active = ~done_i
-						rew_ep_i[active] += reward[active]
-						finished = np.logical_and(done, active)
-						rew_total += sum(rew_ep_i[finished])
-						total_ep += np.sum(finished)
-						success_signal = np.array([
-							info_j.get('chunk_success_signal', reward[idx])
-							for idx, info_j in enumerate(info)
-						])
-						success_i[np.logical_and(active, success_signal > -self.rew_offset)] = 1
-						done_i = np.logical_or(done_i, finished)
-						if np.any(active):
-							r.append(float(np.mean(reward[active])))
-						if (
-							self.algorithm == 'dsrl_na'
-							and not deterministic
-							and hasattr(agent, "get_last_eval_schedule")
-						):
-							schedule = agent.get_last_eval_schedule()
-							steps = schedule.get("steps", np.array([]))
-							chunk_requested = schedule.get("chunk_requested", np.array([]))
-							difficulty = schedule.get("difficulty", np.array([]))
-							n = min(len(active), len(steps), len(chunk_requested), len(info))
-							if n > 0:
-								active_n = active[:n]
-								steps_n = np.asarray(steps[:n], dtype=np.float32)
-								chunk_req_n = np.maximum(np.asarray(chunk_requested[:n], dtype=np.float32), 1.0)
-								chunk_exec_n = np.asarray([
-									float(info_j.get('chunk_exec', chunk_req_n[idx]))
-									for idx, info_j in enumerate(info[:n])
-								], dtype=np.float32)
-								if np.any(active_n):
-									steps_a = steps_n[active_n]
-									chunk_req_a = chunk_req_n[active_n]
-									chunk_exec_a = np.maximum(chunk_exec_n[active_n], 1.0)
-									eval_steps_sum += float(np.sum(steps_a))
-									eval_chunk_requested_sum += float(np.sum(chunk_req_a))
-									eval_chunk_exec_sum += float(np.sum(chunk_exec_a))
-									eval_chunk_requested_values.extend(chunk_req_a.tolist())
-									eval_chunk_exec_values.extend(chunk_exec_a.tolist())
-									query_idx_denoising_steps.setdefault(query_idx, []).append(float(np.mean(steps_a)))
-									query_idx_chunk_requested.setdefault(query_idx, []).append(float(np.mean(chunk_req_a)))
-									query_idx_chunk_exec.setdefault(query_idx, []).append(float(np.mean(chunk_exec_a)))
-									query_idx_requested_nfe.setdefault(query_idx, []).append(float(np.mean(steps_a / chunk_req_a)))
-									query_idx_executed_nfe.setdefault(query_idx, []).append(float(np.mean(steps_a / chunk_exec_a)))
-									if len(difficulty) >= n:
-										diff_a = np.asarray(difficulty[:n], dtype=np.float32)[active_n]
-										query_idx_difficulty.setdefault(query_idx, []).append(float(np.mean(diff_a)))
-						if np.all(done_i):
-							break
-					success.append(success_i.mean())
-					rews.append(float(np.mean(r)) if len(r) > 0 else 0.0)
-					print(f'eval episode {i} at timestep {self.total_timesteps}')
-				success_rate = np.mean(success)
-				if total_ep > 0:
-					avg_rew = rew_total / total_ep
+		if self.eval_episodes <= 0:
+			return
+		env = self.eval_env
+		with torch.no_grad():
+			track_elastic = self.algorithm == 'dsrl_na' and (not deterministic) and hasattr(agent, "start_eval_tracking")
+			if track_elastic:
+				agent.start_eval_tracking()
+			success = []
+			rew_total, total_ep = 0, 0
+			eval_steps_sum = 0.0
+			eval_chunk_requested_sum = 0.0
+			eval_chunk_exec_sum = 0.0
+			eval_chunk_requested_values = []
+			eval_chunk_exec_values = []
+			query_steps = {}
+			query_steps_target = {}
+			query_chunk_requested = {}
+			query_chunk_target = {}
+			query_chunk_exec = {}
+			query_requested_nfe = {}
+			query_executed_nfe = {}
+			query_difficulty = {}
+			query_difficulty_abs = {}
+			query_prior_u = {}
+			query_schedule_rows = []
+			for i in range(self.eval_episodes):
+				obs = env.reset()
+				success_i = np.zeros(obs.shape[0])
+				done_i = np.zeros(obs.shape[0], dtype=bool)
+				env_step_i = np.zeros(obs.shape[0], dtype=np.int32)
+				rew_ep_i = np.zeros(obs.shape[0])
+				query_cap = self.max_steps
+				if self.algorithm == 'dsrl_na' and self.max_steps > 0:
+					query_cap = self.max_steps * self.action_chunk
+				for query_idx in range(query_cap):
+					if self.algorithm == 'dsrl_sac':
+						action, _ = agent.predict(obs, deterministic=deterministic)
+					elif self.algorithm == 'dsrl_na':
+						action, _ = agent.predict_diffused(obs, deterministic=deterministic)
+						self._set_pending_chunk_exec(env, agent)
+					next_obs, reward, done, info = env.step(action)
+					obs = next_obs
+					active = ~done_i
+					rew_ep_i[active] += reward[active]
+					finished = np.logical_and(done, active)
+					rew_total += sum(rew_ep_i[finished])
+					total_ep += np.sum(finished)
+					success_signal = np.array([
+						info_j.get('chunk_success_signal', reward[idx])
+						for idx, info_j in enumerate(info)
+					])
+					success_i[np.logical_and(active, success_signal > -self.rew_offset)] = 1
+					done_i = np.logical_or(done_i, finished)
+					if (
+						self.algorithm == 'dsrl_na'
+						and not deterministic
+						and hasattr(agent, "get_last_eval_schedule")
+					):
+						schedule = agent.get_last_eval_schedule()
+						steps = schedule.get("steps", np.array([]))
+						chunk_requested = schedule.get("chunk_requested", np.array([]))
+						steps_target = schedule.get("steps_target", np.array([]))
+						chunk_target = schedule.get("chunk_target", np.array([]))
+						difficulty = schedule.get("difficulty", np.array([]))
+						prior_u = schedule.get("difficulty_prior_u", np.array([]))
+						n = min(len(active), len(steps), len(chunk_requested), len(info))
+						if n > 0:
+							active_n = active[:n]
+							steps_n = np.asarray(steps[:n], dtype=np.float32)
+							chunk_req_n = np.maximum(np.asarray(chunk_requested[:n], dtype=np.float32), 1.0)
+							steps_target_n = np.asarray(steps_target[:n], dtype=np.float32) if len(steps_target) >= n else steps_n
+							chunk_target_n = np.asarray(chunk_target[:n], dtype=np.float32) if len(chunk_target) >= n else chunk_req_n
+							difficulty_n = np.asarray(difficulty[:n], dtype=np.float32) if len(difficulty) >= n else np.zeros(n, dtype=np.float32)
+							prior_u_n = np.asarray(prior_u[:n], dtype=np.float32) if len(prior_u) >= n else np.zeros(n, dtype=np.float32)
+							chunk_exec_n = np.asarray([
+								float(info_j.get('chunk_exec', chunk_req_n[idx]))
+								for idx, info_j in enumerate(info[:n])
+							], dtype=np.float32)
+							step_start_n = env_step_i[:n].copy()
+							step_end_n = step_start_n + np.maximum(chunk_exec_n, 1.0).astype(np.int32)
+							if np.any(active_n):
+								steps_a = steps_n[active_n]
+								chunk_req_a = chunk_req_n[active_n]
+								chunk_exec_a = np.maximum(chunk_exec_n[active_n], 1.0)
+								eval_steps_sum += float(np.sum(steps_a))
+								eval_chunk_requested_sum += float(np.sum(chunk_req_a))
+								eval_chunk_exec_sum += float(np.sum(chunk_exec_a))
+								eval_chunk_requested_values.extend(chunk_req_a.tolist())
+								eval_chunk_exec_values.extend(chunk_exec_a.tolist())
+								for env_idx in np.flatnonzero(active_n):
+									step_v = float(steps_n[env_idx])
+									step_target_v = float(steps_target_n[env_idx])
+									chunk_req_v = float(chunk_req_n[env_idx])
+									chunk_target_v = float(chunk_target_n[env_idx])
+									chunk_exec_v = float(max(chunk_exec_n[env_idx], 1.0))
+									diff_v = float(difficulty_n[env_idx])
+									prior_u_v = float(prior_u_n[env_idx])
+									req_nfe_v = step_v / max(chunk_req_v, 1.0)
+									exec_nfe_v = step_v / max(chunk_exec_v, 1.0)
+									query_steps.setdefault(query_idx, []).append(step_v)
+									query_steps_target.setdefault(query_idx, []).append(step_target_v)
+									query_chunk_requested.setdefault(query_idx, []).append(chunk_req_v)
+									query_chunk_target.setdefault(query_idx, []).append(chunk_target_v)
+									query_chunk_exec.setdefault(query_idx, []).append(chunk_exec_v)
+									query_requested_nfe.setdefault(query_idx, []).append(req_nfe_v)
+									query_executed_nfe.setdefault(query_idx, []).append(exec_nfe_v)
+									query_difficulty.setdefault(query_idx, []).append(diff_v)
+									query_difficulty_abs.setdefault(query_idx, []).append(abs(diff_v))
+									query_prior_u.setdefault(query_idx, []).append(prior_u_v)
+									query_schedule_rows.append([
+										int(i), int(env_idx), int(query_idx), int(step_start_n[env_idx]), int(step_end_n[env_idx]),
+										step_target_v, step_v, chunk_target_v, chunk_req_v, chunk_exec_v,
+										req_nfe_v, exec_nfe_v, diff_v, prior_u_v, int(done[env_idx]), int(success_i[env_idx]),
+									])
+							env_step_i[:n] = np.where(active_n, step_end_n, env_step_i[:n])
+					if np.all(done_i):
+						break
+				success.append(success_i.mean())
+				print(f'eval episode {i} at timestep {self.total_timesteps}')
+			success_rate = np.mean(success)
+			avg_rew = rew_total / total_ep if total_ep > 0 else 0
+			if self.use_wandb:
+				name = 'eval'
+				if deterministic:
+					wandb.log({
+						f"{name}/success_rate_deterministic": success_rate,
+						f"{name}/reward_deterministic": avg_rew,
+					}, step=self.log_count)
 				else:
-					avg_rew = 0
+					wandb.log({
+						f"{name}/success_rate": success_rate,
+						f"{name}/reward": avg_rew,
+						f"{name}/timesteps": self.total_timesteps,
+					}, step=self.log_count)
+			if (
+				self.algorithm == 'dsrl_na'
+				and not deterministic
+				and hasattr(agent, "stop_eval_tracking")
+				and hasattr(agent, "update_phase_from_eval")
+			):
+				elastic_stats = agent.stop_eval_tracking()
+				requested_nfe = eval_steps_sum / max(eval_chunk_requested_sum, 1.0)
+				executed_nfe = eval_steps_sum / max(eval_chunk_exec_sum, 1.0)
+				agent.update_phase_from_eval(success_rate=success_rate, avg_nfe=executed_nfe)
 				if self.use_wandb:
-					name = 'eval'
-					if deterministic:
-						wandb.log({
-							f"{name}/success_rate_deterministic": success_rate,
-							f"{name}/reward_deterministic": avg_rew,
-						}, step=self.log_count)
-					else:
-						wandb.log({
-							f"{name}/success_rate": success_rate,
-							f"{name}/reward": avg_rew,
-							f"{name}/timesteps": self.total_timesteps,
-						}, step=self.log_count)
-				if (
-					self.algorithm == 'dsrl_na'
-					and not deterministic
-					and hasattr(agent, "stop_eval_tracking")
-					and hasattr(agent, "update_phase_from_eval")
-				):
-					elastic_stats = agent.stop_eval_tracking()
-					requested_nfe = eval_steps_sum / max(eval_chunk_requested_sum, 1.0)
-					executed_nfe = eval_steps_sum / max(eval_chunk_exec_sum, 1.0)
-					agent.update_phase_from_eval(success_rate=success_rate, avg_nfe=executed_nfe)
-					if self.use_wandb:
-						elastic_payload = {
-							"eval/avg_denoising_steps": elastic_stats.get("avg_steps", 0.0),
-							"eval/avg_chunk_size": elastic_stats.get("avg_chunk", 0.0),
-							"eval/avg_denoising_steps_target": elastic_stats.get("avg_steps_target", 0.0),
-							"eval/avg_chunk_size_target": elastic_stats.get("avg_chunk_target", 0.0),
-							"eval/target_exec_mismatch_steps": elastic_stats.get("target_exec_mismatch_steps", 0.0),
-							"eval/target_exec_mismatch_chunk": elastic_stats.get("target_exec_mismatch_chunk", 0.0),
-							"eval/avg_difficulty": elastic_stats.get("avg_difficulty", 0.0),
-							"eval/avg_difficulty_prior_u": elastic_stats.get("avg_difficulty_prior_u", 0.0),
-							"evaluation/requested_nfe_amortized": requested_nfe,
-							"evaluation/nfe_amortized": executed_nfe,
-							"evaluation/chunk_requested_mean": float(np.mean(eval_chunk_requested_values)) if len(eval_chunk_requested_values) > 0 else 0.0,
-							"evaluation/chunk_exec_mean": float(np.mean(eval_chunk_exec_values)) if len(eval_chunk_exec_values) > 0 else 0.0,
-							"evaluation/chunk_exec_over_requested_ratio": eval_chunk_exec_sum / max(eval_chunk_requested_sum, 1.0),
-						}
-						query_idx_keys = sorted(set().union(
-							query_idx_requested_nfe.keys(),
-							query_idx_executed_nfe.keys(),
-							query_idx_chunk_requested.keys(),
-							query_idx_chunk_exec.keys(),
-							query_idx_denoising_steps.keys(),
-							query_idx_difficulty.keys(),
-						))
-						if query_idx_keys:
-							def _query_mean(bucket, q_idx):
-								values = bucket.get(q_idx, [])
-								return float(np.mean(values)) if values else 0.0
-							query_idx_schedule_rows = [
+					elastic_payload = {
+						"eval/avg_denoising_steps": elastic_stats.get("avg_steps", 0.0),
+						"eval/avg_chunk_size": elastic_stats.get("avg_chunk", 0.0),
+						"eval/avg_denoising_steps_target": elastic_stats.get("avg_steps_target", 0.0),
+						"eval/avg_chunk_size_target": elastic_stats.get("avg_chunk_target", 0.0),
+						"eval/target_exec_mismatch_steps": elastic_stats.get("target_exec_mismatch_steps", 0.0),
+						"eval/target_exec_mismatch_chunk": elastic_stats.get("target_exec_mismatch_chunk", 0.0),
+						"eval/avg_difficulty_abs": elastic_stats.get("avg_difficulty_abs", 0.0),
+						"eval/avg_difficulty_prior_u_abs": elastic_stats.get("avg_difficulty_prior_u_abs", 0.0),
+						"evaluation/requested_nfe_amortized": requested_nfe,
+						"evaluation/nfe_amortized": executed_nfe,
+						"evaluation/chunk_requested_mean": float(np.mean(eval_chunk_requested_values)) if len(eval_chunk_requested_values) > 0 else 0.0,
+						"evaluation/chunk_exec_mean": float(np.mean(eval_chunk_exec_values)) if len(eval_chunk_exec_values) > 0 else 0.0,
+					}
+					query_idx_keys = sorted(query_steps.keys())
+					if query_idx_keys:
+						def _query_mean(bucket, q_idx):
+							values = np.asarray(bucket.get(q_idx, []), dtype=np.float32)
+							return float(np.mean(values)) if values.size > 0 else 0.0
+						query_idx_schedule_table = wandb.Table(
+							data=[
 								[
 									int(q_idx),
-									_query_mean(query_idx_requested_nfe, q_idx),
-									_query_mean(query_idx_executed_nfe, q_idx),
-									_query_mean(query_idx_chunk_requested, q_idx),
-									_query_mean(query_idx_chunk_exec, q_idx),
-									_query_mean(query_idx_denoising_steps, q_idx),
-									_query_mean(query_idx_difficulty, q_idx),
-									max(
-										len(query_idx_requested_nfe.get(q_idx, [])),
-										len(query_idx_chunk_requested.get(q_idx, [])),
-										len(query_idx_denoising_steps.get(q_idx, [])),
-										len(query_idx_difficulty.get(q_idx, [])),
-									),
+									_query_mean(query_steps_target, q_idx),
+									_query_mean(query_steps, q_idx),
+									_query_mean(query_chunk_target, q_idx),
+									_query_mean(query_chunk_requested, q_idx),
+									_query_mean(query_chunk_exec, q_idx),
+									_query_mean(query_requested_nfe, q_idx),
+									_query_mean(query_executed_nfe, q_idx),
+									_query_mean(query_difficulty, q_idx),
+									_query_mean(query_difficulty_abs, q_idx),
+									_query_mean(query_prior_u, q_idx),
+									len(query_steps.get(q_idx, [])),
 								]
 								for q_idx in query_idx_keys
-							]
-							query_idx_schedule_table = wandb.Table(
-								data=query_idx_schedule_rows,
-								columns=[
-									"query_idx",
-									"requested_nfe_amortized_mean",
-									"executed_nfe_amortized_mean",
-									"chunk_requested_mean",
-									"chunk_exec_mean",
-									"denoising_steps_mean",
-									"difficulty_mean",
-									"count",
-								],
-							)
-							elastic_payload["eval/query_idx_schedule_table"] = query_idx_schedule_table
-							elastic_payload["eval/query_idx_nfe"] = wandb.plot.line(
-								query_idx_schedule_table,
-								"query_idx",
-								"requested_nfe_amortized_mean",
-								title="Requested Amortized NFE by Query Index",
-							)
-							elastic_payload["eval/query_idx_chunk"] = wandb.plot.line(
-								query_idx_schedule_table,
-								"query_idx",
-								"chunk_requested_mean",
-								title="Requested Chunk by Query Index",
-							)
-							elastic_payload["eval/query_idx_denoising_steps"] = wandb.plot.line(
-								query_idx_schedule_table,
-								"query_idx",
-								"denoising_steps_mean",
-								title="Denoising Steps by Query Index",
-							)
-							elastic_payload["eval/query_idx_difficulty"] = wandb.plot.line(
-								query_idx_schedule_table,
-								"query_idx",
-								"difficulty_mean",
-								title="Difficulty by Query Index",
-							)
-						wandb.log(elastic_payload, step=self.log_count)
-				self._log_eval_video(agent, deterministic=deterministic)
+							],
+							columns=[
+								"query_idx", "steps_target_mean", "steps_exec_mean", "chunk_target_mean",
+								"chunk_requested_mean", "chunk_exec_mean", "requested_nfe_mean",
+								"executed_nfe_mean", "difficulty_mean", "difficulty_abs_mean",
+								"difficulty_prior_u_mean", "count",
+							],
+						)
+						elastic_payload["eval/query_idx_schedule_table"] = query_idx_schedule_table
+						elastic_payload["eval/query_idx_steps_exec"] = wandb.plot.line(query_idx_schedule_table, "query_idx", "steps_exec_mean", title="Denoising Steps by Query Index")
+						elastic_payload["eval/query_idx_chunk_requested"] = wandb.plot.line(query_idx_schedule_table, "query_idx", "chunk_requested_mean", title="Requested Chunk by Query Index")
+						elastic_payload["eval/query_idx_requested_nfe"] = wandb.plot.line(query_idx_schedule_table, "query_idx", "requested_nfe_mean", title="Requested NFE by Query Index")
+						elastic_payload["eval/query_idx_executed_nfe"] = wandb.plot.line(query_idx_schedule_table, "query_idx", "executed_nfe_mean", title="Executed NFE by Query Index")
+						elastic_payload["eval/query_idx_difficulty"] = wandb.plot.line(query_idx_schedule_table, "query_idx", "difficulty_mean", title="Difficulty by Query Index")
+						elastic_payload["eval/query_idx_difficulty_abs"] = wandb.plot.line(query_idx_schedule_table, "query_idx", "difficulty_abs_mean", title="Difficulty Magnitude by Query Index")
+					if query_schedule_rows:
+						elastic_payload["eval/query_schedule_table"] = wandb.Table(
+							data=query_schedule_rows,
+							columns=[
+								"episode_id", "env_id", "query_idx", "env_step_start", "env_step_end",
+								"steps_target", "steps_exec", "chunk_target", "chunk_requested",
+								"chunk_exec", "requested_nfe", "executed_nfe", "difficulty",
+								"difficulty_prior_u", "done_after_query", "success_so_far",
+							],
+						)
+					wandb.log(elastic_payload, step=self.log_count)
+			self._log_eval_video(agent, deterministic=deterministic)
 
 	def set_timesteps(self, timesteps):
 		self.total_timesteps = timesteps

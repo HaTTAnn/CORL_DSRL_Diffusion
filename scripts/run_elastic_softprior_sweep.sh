@@ -12,6 +12,14 @@ DRY_RUN="${DRY_RUN:-0}"
 WANDB_GROUP_PREFIX="${WANDB_GROUP_PREFIX:-elastic_softprior_p${PLAN}}"
 LOG_DIR="${LOG_DIR:-$PROJECT_ROOT/run_logs}"
 
+append_export_if_set() {
+  local name="$1"
+  local value="${!name:-}"
+  if [[ -n "$value" ]]; then
+    cmd+=" export ${name}=$(printf '%q' "$value");"
+  fi
+}
+
 IFS=',' read -r -a GPUS <<< "$GPUS_CSV"
 if [[ "${#GPUS[@]}" -lt 1 ]]; then
   echo "no GPU provided" >&2
@@ -23,15 +31,24 @@ case "$PLAN" in
     TASKS=(can square)
     SEEDS=(0 1)
     VARIANTS=(soft_h2_bal soft_h3_safe)
+    EXPECTED=8
     ;;
   16)
     TASKS=(can square)
     SEEDS=(0 1)
     VARIANTS=(soft_h2_bal soft_h2_res soft_h3_safe soft_h2_edge)
+    EXPECTED=16
     ;;
+  square_safe)
+    TASKS=(square)
+    SEEDS=(0 1)
+    VARIANTS=(soft_square_safe soft_h3_safe)
+    EXPECTED=4
+  ;;
   *)
-    echo "usage: $0 [8|16] [gpu_csv] [env_label]" >&2
+    echo "usage: $0 [8|16|square_safe] [gpu_csv] [env_label]" >&2
     echo "example: DRY_RUN=1 $0 16 0,1,2,3,4,5,6,7 uv" >&2
+    echo "example: DRY_RUN=1 $0 square_safe 0,1 uv" >&2
     exit 2
     ;;
 esac
@@ -47,7 +64,7 @@ for variant in "${VARIANTS[@]}"; do
   done
 done
 
-expected="$PLAN"
+expected="$EXPECTED"
 if [[ "${#JOBS[@]}" -ne "$expected" ]]; then
   echo "internal error: plan $PLAN produced ${#JOBS[@]} jobs" >&2
   exit 3
@@ -112,9 +129,12 @@ for i in "${!JOBS[@]}"; do
   cmd+=" export WANDB_GROUP_PREFIX='$WANDB_GROUP_PREFIX';"
   cmd+=" export WANDB_MODE='${WANDB_MODE:-online}';"
   cmd+=" export WANDB_PROJECT='${WANDB_PROJECT:-DSRL_diffusion_FV}';"
-  if [[ -n "${WANDB_ENTITY:-}" ]]; then
-    cmd+=" export WANDB_ENTITY='$WANDB_ENTITY';"
-  fi
+  append_export_if_set WANDB_API_KEY
+  append_export_if_set WANDB_ENTITY
+  append_export_if_set WANDB_BASE_URL
+  append_export_if_set WANDB_DIR
+  append_export_if_set WANDB_CACHE_DIR
+  append_export_if_set WANDB_CONFIG_DIR
   cmd+=" export OMP_NUM_THREADS='${OMP_NUM_THREADS:-1}';"
   cmd+=" export MKL_NUM_THREADS='${MKL_NUM_THREADS:-1}';"
   cmd+=" export OPENBLAS_NUM_THREADS='${OPENBLAS_NUM_THREADS:-1}';"

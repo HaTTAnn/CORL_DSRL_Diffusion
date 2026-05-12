@@ -132,13 +132,12 @@ train:
   difficulty_prior_warmup_steps: 50000
   difficulty_prior_scale: 0.75
   difficulty_prior_deadband: 0.03
-  difficulty_prior_signal_mode: rank_tanh
+  difficulty_prior_signal_mode: compute_advantage
   difficulty_prior_signal_scale: 1.0
   difficulty_prior_gate_floor: 0.0
-  difficulty_stat_ema_beta: 0.99
   difficulty_weight: 0.04
   difficulty_loss_mode: elastic_margin_hinge
-  difficulty_signal_mode: rank_tanh
+  difficulty_signal_mode: compute_advantage
   difficulty_signal_scale: 0.75
   difficulty_start_step: 40000
   difficulty_warmup_steps: 50000

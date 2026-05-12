@@ -81,6 +81,8 @@ class DiffusionEval(DiffusionModel):
         cond,
         index=None,
         deterministic=False,
+        ddim_alpha=None,
+        ddim_alpha_prev=None,
     ):
         noise = self.actor(x, t, cond=cond)
 
@@ -90,11 +92,16 @@ class DiffusionEval(DiffusionModel):
                 """
                 x₀ = (xₜ - √ (1-αₜ) ε )/ √ αₜ
                 """
-                alpha = extract(self.ddim_alphas, index, x.shape)
-                alpha_prev = extract(self.ddim_alphas_prev, index, x.shape)
-                sqrt_one_minus_alpha = extract(
-                    self.ddim_sqrt_one_minus_alphas, index, x.shape
-                )
+                if ddim_alpha is None:
+                    alpha = extract(self.ddim_alphas, index, x.shape)
+                    alpha_prev = extract(self.ddim_alphas_prev, index, x.shape)
+                    sqrt_one_minus_alpha = extract(
+                        self.ddim_sqrt_one_minus_alphas, index, x.shape
+                    )
+                else:
+                    alpha = ddim_alpha
+                    alpha_prev = ddim_alpha_prev
+                    sqrt_one_minus_alpha = torch.sqrt(torch.clamp(1.0 - alpha, min=0.0))
                 x_recon = (x - sqrt_one_minus_alpha * noise) / (alpha**0.5)
             else:
                 """
@@ -125,11 +132,13 @@ class DiffusionEval(DiffusionModel):
                 etas = torch.zeros((x.shape[0], 1, 1)).to(x.device)
             else:
                 etas = self.eta(cond).unsqueeze(1)  # B x 1 x (Da or 1)
-            sigma = (
-                etas
-                * ((1 - alpha_prev) / (1 - alpha) * (1 - alpha / alpha_prev)) ** 0.5
-            ).clamp_(min=1e-10)
-            dir_xt_coef = (1.0 - alpha_prev - sigma**2).clamp_(min=0).sqrt()
+            sigma_arg = (
+                (1 - alpha_prev)
+                / torch.clamp(1 - alpha, min=1e-12)
+                * (1 - alpha / alpha_prev)
+            ).clamp(min=0.0)
+            sigma = (etas * torch.sqrt(sigma_arg)).clamp_(min=1e-10)
+            dir_xt_coef = torch.sqrt(torch.clamp(1.0 - alpha_prev - sigma**2, min=0.0))
             mu = (alpha_prev**0.5) * x_recon + dir_xt_coef * noise
             var = sigma**2
             logvar = torch.log(var)

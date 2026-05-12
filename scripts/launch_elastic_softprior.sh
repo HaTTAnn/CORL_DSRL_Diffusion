@@ -38,6 +38,7 @@ EVAL_VIDEO_FREQ="${EVAL_VIDEO_FREQ:-1}"
 WANDB_PROJECT="${WANDB_PROJECT:-DSRL_diffusion_FV}"
 WANDB_GROUP_PREFIX="${WANDB_GROUP_PREFIX:-elastic_softprior}"
 RUN_TAG="${RUN_TAG:-$(date +%Y_%m_%d_%H_%M_%S)}"
+INIT_ROLLOUT_STEPS="${INIT_ROLLOUT_STEPS:-}"
 
 case "$TASK" in
   can|lift|square) ;;
@@ -104,7 +105,7 @@ case "$VARIANT" in
     DIFFICULTY_WEIGHT=0.04
     DIFFICULTY_MODE_MARGIN_WEIGHT=0.20
     ;;
-  # More residual authority, weaker q_std prior. Use if q_std phase alignment is noisy.
+  # More residual authority with weaker compute-advantage prior.
   soft_h2_res)
     DIFFICULTY_PRIOR_SCALE=0.55
     DIFFICULTY_HARD_CHUNK_TARGET=2
@@ -131,11 +132,39 @@ case "$VARIANT" in
     DIFFICULTY_WEIGHT=0.04
     DIFFICULTY_MODE_MARGIN_WEIGHT=0.20
     ;;
+  # SQUARE-only conservative point: keep chunk safe, raise easy-step floor, and relax the NFE target.
+  soft_square_safe)
+    if [[ "$TASK" != "square" ]]; then
+      echo "variant soft_square_safe is only intended for task=square" >&2
+      exit 2
+    fi
+    TARGET_NFE=1.90
+    NFE_TARGET_LOWER=1.75
+    NFE_TARGET_UPPER=2.15
+    DIFFICULTY_PRIOR_SCALE=0.70
+    DIFFICULTY_HARD_CHUNK_TARGET=3
+    DIFFICULTY_EASY_STEPS_TARGET=5
+    DIFFICULTY_EASY_CHUNK_TARGET=4
+    PREPRIOR_RESIDUAL_SCALE=0.75
+    SCHEDULE_RESIDUAL_SCALE=0.35
+    DIFFICULTY_WEIGHT=0.025
+    DIFFICULTY_MODE_MARGIN_WEIGHT=0.15
+    INIT_ROLLOUT_STEPS="${INIT_ROLLOUT_STEPS:-8000}"
+    ;;
   *)
-    echo "unknown variant: $VARIANT (expected soft_h2_bal|soft_h2_res|soft_h3_safe|soft_h2_edge)" >&2
+    echo "unknown variant: $VARIANT (expected soft_h2_bal|soft_h2_res|soft_h3_safe|soft_h2_edge|soft_square_safe)" >&2
     exit 2
     ;;
 esac
+
+if [[ "$TASK" == "square" ]]; then
+  INIT_ROLLOUT_STEPS="${INIT_ROLLOUT_STEPS:-8000}"
+fi
+
+EXTRA_OVERRIDES=()
+if [[ -n "$INIT_ROLLOUT_STEPS" ]]; then
+  EXTRA_OVERRIDES+=(++train.init_rollout_steps="$INIT_ROLLOUT_STEPS")
+fi
 
 cd "$PROJECT_ROOT"
 
@@ -168,6 +197,9 @@ echo "python: $(which python)"
 echo "run=${RUN_NAME} gpu=${GPU} task=${TASK} seed=${SEED} variant=${VARIANT}"
 echo "soft-prior: scale=${DIFFICULTY_PRIOR_SCALE}, hard_steps=${DIFFICULTY_HARD_STEPS_TARGET}, hard_chunk=${DIFFICULTY_HARD_CHUNK_TARGET}, easy_steps=${DIFFICULTY_EASY_STEPS_TARGET}, easy_chunk=${DIFFICULTY_EASY_CHUNK_TARGET}, preprior=${PREPRIOR_RESIDUAL_SCALE}, residual=${SCHEDULE_RESIDUAL_SCALE}"
 echo "cost: band=[${NFE_TARGET_LOWER},${NFE_TARGET_UPPER}], lambda=${ACTOR_COMPUTE_LAMBDA_WARMUP}->${ACTOR_COMPUTE_LAMBDA}, debt=${NFE_DEBT_LIMIT}, saving=${NFE_SAVING_WEIGHT}"
+if [[ -n "$INIT_ROLLOUT_STEPS" ]]; then
+  echo "rollout: init_rollout_steps=${INIT_ROLLOUT_STEPS}"
+fi
 
 python train_dsrl.py --config-name "dsrl_${TASK}.yaml" \
   seed="$SEED" \
@@ -229,13 +261,12 @@ python train_dsrl.py --config-name "dsrl_${TASK}.yaml" \
   ++train.difficulty_prior_warmup_steps="$DIFFICULTY_PRIOR_WARMUP_STEPS" \
   ++train.difficulty_prior_scale="$DIFFICULTY_PRIOR_SCALE" \
   ++train.difficulty_prior_deadband=0.03 \
-  ++train.difficulty_prior_signal_mode=rank_tanh \
+  ++train.difficulty_prior_signal_mode=compute_advantage \
   ++train.difficulty_prior_signal_scale=1.0 \
   ++train.difficulty_prior_gate_floor=0.0 \
-  ++train.difficulty_stat_ema_beta=0.99 \
   ++train.difficulty_weight="$DIFFICULTY_WEIGHT" \
   ++train.difficulty_loss_mode=elastic_margin_hinge \
-  ++train.difficulty_signal_mode=rank_tanh \
+  ++train.difficulty_signal_mode=compute_advantage \
   ++train.difficulty_signal_scale=0.75 \
   ++train.difficulty_start_step="$DIFFICULTY_START_STEP" \
   ++train.difficulty_warmup_steps="$DIFFICULTY_WARMUP_STEPS" \
@@ -255,4 +286,5 @@ python train_dsrl.py --config-name "dsrl_${TASK}.yaml" \
   ++train.difficulty_success_no_close="$DIFFICULTY_SUCCESS_NO_CLOSE" \
   ++train.eval_success_ema_beta=0.8 \
   ++train.range_success_ema_beta="$RANGE_SUCCESS_EMA_BETA" \
-  ++train.difficulty_success_ema_beta="$DIFFICULTY_SUCCESS_EMA_BETA"
+  ++train.difficulty_success_ema_beta="$DIFFICULTY_SUCCESS_EMA_BETA" \
+  "${EXTRA_OVERRIDES[@]}"
