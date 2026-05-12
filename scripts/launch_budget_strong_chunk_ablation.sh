@@ -245,13 +245,12 @@ python train_dsrl.py --config-name "dsrl_${TASK}.yaml" \
   ++train.difficulty_prior_warmup_steps="$DIFFICULTY_PRIOR_WARMUP_STEPS" \
   ++train.difficulty_prior_scale="$DIFFICULTY_PRIOR_SCALE" \
   ++train.difficulty_prior_deadband=0.03 \
-  ++train.difficulty_prior_signal_mode=rank_tanh \
+  ++train.difficulty_prior_signal_mode=compute_advantage \
   ++train.difficulty_prior_signal_scale=1.0 \
   ++train.difficulty_prior_gate_floor=0.0 \
-  ++train.difficulty_stat_ema_beta=0.99 \
   ++train.difficulty_weight=0.04 \
   ++train.difficulty_loss_mode=elastic_margin_hinge \
-  ++train.difficulty_signal_mode=rank_tanh \
+  ++train.difficulty_signal_mode=compute_advantage \
   ++train.difficulty_signal_scale=0.75 \
   ++train.difficulty_start_step="$DIFFICULTY_START_STEP" \
   ++train.difficulty_warmup_steps="$DIFFICULTY_WARMUP_STEPS" \

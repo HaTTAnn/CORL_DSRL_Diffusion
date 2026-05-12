@@ -173,13 +173,12 @@ class DSRL(OffPolicyAlgorithm):
 		difficulty_prior_warmup_steps: float = 20000.0,
 		difficulty_prior_scale: float = 0.85,
 		difficulty_prior_deadband: float = 0.0,
-		difficulty_prior_signal_mode: str = "rank_tanh",
+		difficulty_prior_signal_mode: str = "compute_advantage",
 		difficulty_prior_signal_scale: float = 2.0,
 		difficulty_prior_gate_floor: float = 0.3,
-		difficulty_stat_ema_beta: float = 0.99,
 		difficulty_weight: float = 0.3,
 		difficulty_loss_mode: str = "elastic_margin_hinge",
-		difficulty_signal_mode: str = "rank_tanh",
+		difficulty_signal_mode: str = "compute_advantage",
 		difficulty_signal_scale: float = 1.0,
 		difficulty_start_step: float = 0.0,
 		difficulty_warmup_steps: float = 20000.0,
@@ -328,12 +327,15 @@ class DSRL(OffPolicyAlgorithm):
 		self.difficulty_prior_scale = float(max(0.0, difficulty_prior_scale))
 		self.difficulty_prior_deadband = float(np.clip(difficulty_prior_deadband, 0.0, 0.99))
 		self.difficulty_prior_signal_mode = str(difficulty_prior_signal_mode).lower()
+		if not self._uses_compute_advantage_signal(self.difficulty_prior_signal_mode):
+			raise ValueError("Legacy difficulty signals were removed; use compute_advantage or compute_advantage_<transform>.")
 		self.difficulty_prior_signal_scale = float(max(0.0, difficulty_prior_signal_scale))
 		self.difficulty_prior_gate_floor = float(np.clip(difficulty_prior_gate_floor, 0.0, 1.0))
-		self.difficulty_stat_ema_beta = float(np.clip(difficulty_stat_ema_beta, 0.0, 0.9999))
 		self.difficulty_weight = float(max(0.0, difficulty_weight))
 		self.difficulty_loss_mode = str(difficulty_loss_mode).lower()
 		self.difficulty_signal_mode = str(difficulty_signal_mode).lower()
+		if not self._uses_compute_advantage_signal(self.difficulty_signal_mode):
+			raise ValueError("Legacy difficulty signals were removed; use compute_advantage or compute_advantage_<transform>.")
 		self.difficulty_signal_scale = float(max(0.0, difficulty_signal_scale))
 		self.difficulty_start_step = float(max(0.0, difficulty_start_step))
 		self.difficulty_warmup_steps = float(max(0.0, difficulty_warmup_steps))
@@ -367,8 +369,6 @@ class DSRL(OffPolicyAlgorithm):
 		self.steps_log_std: Optional[nn.Linear] = None
 		self.chunk_mu: Optional[nn.Linear] = None
 		self.chunk_log_std: Optional[nn.Linear] = None
-		self._difficulty_q_std_mean: Optional[float] = None
-		self._difficulty_q_std_second: Optional[float] = None
 		self._last_schedule_info: dict[str, Any] = {}
 		self._eval_tracking = False
 		self._eval_nfes: list[float] = []
@@ -691,42 +691,6 @@ class DSRL(OffPolicyAlgorithm):
 		shrunk = th.sign(signal) * (abs_signal - deadband) / max(1e-6, 1.0 - deadband)
 		return th.where(abs_signal <= deadband, th.zeros_like(signal), th.clamp(shrunk, -1.0, 1.0))
 
-	def _estimate_q_std(self, obs: th.Tensor, w_noise: Optional[th.Tensor] = None) -> th.Tensor:
-		batch = obs.shape[0]
-		with th.no_grad():
-			if not self.enable_three_head:
-				return th.zeros((batch, 1), device=obs.device, dtype=obs.dtype)
-			if w_noise is None:
-				w_noise, _ = self.actor.action_log_prob(obs)
-			default_steps = self._control_from_fixed(
-				self.fixed_denoising_steps,
-				self.min_denoising_steps,
-				self.max_denoising_steps,
-				batch,
-			).to(device=obs.device, dtype=w_noise.dtype)
-			default_chunk = self._control_from_fixed(
-				self.fixed_chunk_size,
-				self.min_chunk_size,
-				self.max_chunk_size,
-				batch,
-			).to(device=obs.device, dtype=w_noise.dtype)
-			noise_input = th.cat([w_noise.detach(), default_steps, default_chunk], dim=1)
-			q_values = th.cat(self.critic_noise(obs, noise_input), dim=1)
-			if q_values.shape[1] <= 1:
-				q_std = th.zeros((batch, 1), device=obs.device, dtype=obs.dtype)
-			else:
-				q_std = q_values.std(dim=1, keepdim=True, unbiased=False)
-			batch_mean = float(q_std.mean().item())
-			batch_second = float((q_std * q_std).mean().item())
-			if self._difficulty_q_std_mean is None or self._difficulty_q_std_second is None:
-				self._difficulty_q_std_mean = batch_mean
-				self._difficulty_q_std_second = batch_second
-			else:
-				beta = self.difficulty_stat_ema_beta
-				self._difficulty_q_std_mean = beta * self._difficulty_q_std_mean + (1.0 - beta) * batch_mean
-				self._difficulty_q_std_second = beta * self._difficulty_q_std_second + (1.0 - beta) * batch_second
-			return q_std.detach()
-
 	def _uses_compute_advantage_signal(self, mode: str) -> bool:
 		mode = str(mode).lower()
 		return mode in {"compute_advantage", "advantage", "value_advantage"} or mode.startswith("compute_advantage_") or mode.startswith("advantage_") or mode.startswith("value_advantage_")
@@ -737,7 +701,7 @@ class DSRL(OffPolicyAlgorithm):
 			if mode.startswith(prefix):
 				return mode[len(prefix):]
 		if self._uses_compute_advantage_signal(mode):
-			return "rank_tanh"
+			return "rank"
 		return mode
 
 	def _combine_noise_q_values(self, q_values: th.Tensor) -> th.Tensor:
@@ -766,11 +730,11 @@ class DSRL(OffPolicyAlgorithm):
 			q_hard = self._combine_noise_q_values(th.cat(self.critic_noise(obs, hard_input), dim=1))
 			return (q_hard - q_easy).detach()
 
-	def _difficulty_signal_from_q_std(self, q_std: th.Tensor, mode: str, scale: float) -> th.Tensor:
+	def _difficulty_signal_from_score(self, score: th.Tensor, mode: str, scale: float) -> th.Tensor:
 		mode = str(mode).lower()
 		if mode in {"none", "off", "zero"} or scale <= 0.0:
-			return th.zeros_like(q_std)
-		flat = q_std.reshape(-1)
+			return th.zeros_like(score)
+		flat = score.reshape(-1)
 		if mode.startswith("rank"):
 			if flat.numel() <= 1 or (flat.max() - flat.min()).abs().item() <= 1e-8:
 				base = th.zeros_like(flat)
@@ -778,15 +742,14 @@ class DSRL(OffPolicyAlgorithm):
 				order = th.argsort(flat)
 				base = th.empty_like(flat)
 				base[order] = th.linspace(-1.0, 1.0, flat.numel(), device=flat.device, dtype=flat.dtype)
-			base = base.reshape_as(q_std)
+			base = base.reshape_as(score)
 		elif mode.startswith("z"):
-			mean = self._difficulty_q_std_mean if self._difficulty_q_std_mean is not None else float(q_std.mean().item())
-			second = self._difficulty_q_std_second if self._difficulty_q_std_second is not None else float((q_std * q_std).mean().item())
-			var = max(1e-6, second - mean * mean)
-			base = (q_std - mean) / (var ** 0.5)
+			mean = score.mean()
+			std = score.std(unbiased=False).clamp_min(1e-6)
+			base = (score - mean) / std
 		else:
-			denom = q_std.detach().abs().mean().clamp_min(1e-6)
-			base = q_std / denom
+			denom = score.detach().abs().mean().clamp_min(1e-6)
+			base = score / denom
 		if "sigmoid" in mode:
 			return th.clamp(2.0 * th.sigmoid(scale * base) - 1.0, -1.0, 1.0)
 		return th.clamp(th.tanh(scale * base), -1.0, 1.0)
@@ -882,7 +845,6 @@ class DSRL(OffPolicyAlgorithm):
 		self._last_schedule_info = {
 			"difficulty": zeros,
 			"difficulty_prior_u": zeros,
-			"q_std": zeros,
 			"difficulty_source_score": zeros,
 			"schedule_gate": 0.0,
 			"difficulty_prior_gate": 0.0,
@@ -974,33 +936,15 @@ class DSRL(OffPolicyAlgorithm):
 			self._record_eval_schedule(default_steps, default_chunk, deterministic)
 			return default_steps, default_log_prob, default_chunk, default_log_prob
 
-		prior_uses_advantage = self._uses_compute_advantage_signal(self.difficulty_prior_signal_mode)
-		difficulty_uses_advantage = self._uses_compute_advantage_signal(self.difficulty_signal_mode)
-		compute_advantage = None
-		q_std = None
-		if prior_uses_advantage or difficulty_uses_advantage:
-			compute_advantage = self._estimate_compute_advantage(obs, w_noise=w_noise)
-		if (not prior_uses_advantage) or (not difficulty_uses_advantage):
-			q_std = self._estimate_q_std(obs, w_noise=w_noise)
-		zero_score = th.zeros((batch, 1), device=obs.device, dtype=obs.dtype)
-		prior_score = compute_advantage if prior_uses_advantage else q_std
-		difficulty_score = compute_advantage if difficulty_uses_advantage else q_std
-		if prior_score is None:
-			prior_score = zero_score
-		if difficulty_score is None:
-			difficulty_score = zero_score
-		difficulty_source_score = compute_advantage if compute_advantage is not None else q_std
-		if difficulty_source_score is None:
-			difficulty_source_score = zero_score
-		q_std_log = q_std if q_std is not None else zero_score
-		prior_u = self._difficulty_signal_from_q_std(
-			prior_score,
+		difficulty_source_score = self._estimate_compute_advantage(obs, w_noise=w_noise)
+		prior_u = self._difficulty_signal_from_score(
+			difficulty_source_score,
 			self._difficulty_signal_transform_mode(self.difficulty_prior_signal_mode),
 			self.difficulty_prior_signal_scale,
 		)
 		prior_u = self._apply_signal_deadband(prior_u, self.difficulty_prior_deadband)
-		difficulty = self._difficulty_signal_from_q_std(
-			difficulty_score,
+		difficulty = self._difficulty_signal_from_score(
+			difficulty_source_score,
 			self._difficulty_signal_transform_mode(self.difficulty_signal_mode),
 			self.difficulty_signal_scale,
 		)
@@ -1042,7 +986,6 @@ class DSRL(OffPolicyAlgorithm):
 		self._last_schedule_info = {
 			"difficulty": difficulty.detach(),
 			"difficulty_prior_u": prior_u.detach(),
-			"q_std": q_std_log.detach(),
 			"difficulty_source_score": difficulty_source_score.detach(),
 			"schedule_gate": float(schedule_gate),
 			"schedule_step_gate": float(schedule_step_gate),
@@ -1304,7 +1247,7 @@ class DSRL(OffPolicyAlgorithm):
 		actor_compute_cost_batch: list[float] = []
 		difficulty_abs_batch: list[float] = []
 		difficulty_prior_abs_batch: list[float] = []
-		difficulty_source_std_batch: list[float] = []
+		difficulty_score_std_batch: list[float] = []
 		difficulty_losses: list[float] = []
 		schedule_gates: list[float] = []
 		prior_gates: list[float] = []
@@ -1451,9 +1394,9 @@ class DSRL(OffPolicyAlgorithm):
 					prior_u = schedule_info.get("difficulty_prior_u")
 					if prior_u is not None:
 						difficulty_prior_abs_batch.append(float(prior_u.detach().abs().mean().item()))
-					source_score = schedule_info.get("difficulty_source_score")
-					if source_score is not None:
-						difficulty_source_std_batch.append(float(source_score.detach().std(unbiased=False).item()))
+					difficulty_score = schedule_info.get("difficulty_source_score")
+					if difficulty_score is not None:
+						difficulty_score_std_batch.append(float(difficulty_score.detach().std(unbiased=False).item()))
 					schedule_gates.append(float(schedule_info.get("schedule_gate", 0.0)))
 					prior_gates.append(float(schedule_info.get("difficulty_prior_gate", 0.0)))
 					if self.schedule_entropy_weight > 0.0 and train_scheduling and self.schedule_control_mode != "prior_only":
@@ -1511,8 +1454,8 @@ class DSRL(OffPolicyAlgorithm):
 			self.logger.record("train/difficulty_abs_mean", np.mean(difficulty_abs_batch))
 		if len(difficulty_prior_abs_batch) > 0:
 			self.logger.record("train/difficulty_prior_u_abs_mean", np.mean(difficulty_prior_abs_batch))
-		if len(difficulty_source_std_batch) > 0:
-			self.logger.record("train/difficulty_source_score_std", np.mean(difficulty_source_std_batch))
+		if len(difficulty_score_std_batch) > 0:
+			self.logger.record("train/compute_advantage_std", np.mean(difficulty_score_std_batch))
 		if len(difficulty_losses) > 0:
 			self.logger.record("train/difficulty_loss", np.mean(difficulty_losses))
 		gate_snapshot = self._gate_snapshot()

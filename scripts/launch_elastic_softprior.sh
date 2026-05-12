@@ -83,7 +83,7 @@ case "$VARIANT" in
     DIFFICULTY_WEIGHT=0.04
     DIFFICULTY_MODE_MARGIN_WEIGHT=0.20
     ;;
-  # More residual authority, weaker q_std prior. Use if q_std phase alignment is noisy.
+  # More residual authority with weaker compute-advantage prior.
   soft_h2_res)
     DIFFICULTY_PRIOR_SCALE=0.55
     DIFFICULTY_HARD_CHUNK_TARGET=2
@@ -228,7 +228,6 @@ python train_dsrl.py --config-name "dsrl_${TASK}.yaml" \
   ++train.difficulty_prior_signal_mode=compute_advantage \
   ++train.difficulty_prior_signal_scale=1.0 \
   ++train.difficulty_prior_gate_floor=0.0 \
-  ++train.difficulty_stat_ema_beta=0.99 \
   ++train.difficulty_weight="$DIFFICULTY_WEIGHT" \
   ++train.difficulty_loss_mode=elastic_margin_hinge \
   ++train.difficulty_signal_mode=compute_advantage \
