@@ -292,6 +292,7 @@ def main(cfg: OmegaConf):
 		eval_video_fps=cfg.env.get("eval_video_fps", 20),
 		eval_video_max_frames=cfg.env.get("eval_video_max_frames", cfg.env.max_episode_steps),
 		eval_video_freq=cfg.env.get("eval_video_freq", 1),
+		target_env_timesteps=cfg.train.get("target_env_timesteps", None),
 	)
 
 	logging_callback.evaluate(model)
@@ -306,9 +307,10 @@ def main(cfg: OmegaConf):
 	callbacks = [logging_callback]
 	if checkpoint_callback is not None:
 		callbacks.insert(0, checkpoint_callback)
-	# Train the agent
+	# Train the agent. Keep the paper-scale default, but allow launch scripts to set
+	# task-specific horizons such as can=1M and square=2M.
 	model.learn(
-		total_timesteps=20000000,
+		total_timesteps=int(cfg.train.get("total_timesteps", 20000000)),
 		callback=callbacks,
 	)
 

@@ -71,6 +71,7 @@ class LoggingCallback(BaseCallback):
 		eval_video_fps=20,
 		eval_video_max_frames=300,
 		eval_video_freq=1,
+		target_env_timesteps=None,
 	):
 		super().__init__(verbose)
 		self.action_chunk = action_chunk
@@ -96,6 +97,7 @@ class LoggingCallback(BaseCallback):
 		self.eval_video_fps = max(1, int(eval_video_fps))
 		self.eval_video_max_frames = max(1, int(eval_video_max_frames))
 		self.eval_video_freq = max(1, int(eval_video_freq))
+		self.target_env_timesteps = None if target_env_timesteps is None else int(target_env_timesteps)
 		self._eval_video_calls = 0
 		self._eval_video_warned = False
 
@@ -392,6 +394,11 @@ class LoggingCallback(BaseCallback):
 						"train/difficulty_mean",
 						"train/difficulty_prior_u_mean",
 						"train/difficulty_loss",
+						"train/difficulty_source_score_mean",
+						"train/difficulty_source_score_std",
+						"train/difficulty_prior_source_score_mean",
+						"train/difficulty_prior_source_score_std",
+						"train/effective_step_prior_authority",
 						"train/schedule_gate",
 						"train/active_schedule_residual_scale",
 						"train/effective_schedule_residual_scale",
@@ -429,8 +436,15 @@ class LoggingCallback(BaseCallback):
 				self.episode_success = np.zeros(self.num_train_env)
 				self.episode_completed = np.zeros(self.num_train_env)
 
+		evaluated_now = False
 		if self.n_calls % self.eval_freq == 0:
 			self.evaluate(self.locals['self'])
+			evaluated_now = True
+		if self.target_env_timesteps is not None and self.total_timesteps >= self.target_env_timesteps:
+			if not evaluated_now:
+				self.evaluate(self.locals['self'])
+			print(f"target_env_timesteps reached: {self.total_timesteps} >= {self.target_env_timesteps}")
+			return False
 		return True
 	
 	def evaluate(self, agent):
@@ -455,6 +469,8 @@ class LoggingCallback(BaseCallback):
 			eval_executed_nfe_values = []
 			eval_difficulty_values = []
 			eval_prior_u_values = []
+			eval_source_score_values = []
+			eval_prior_source_score_values = []
 			eval_query_idx_values = []
 			eval_episode_success_values = []
 			eval_episode_steps = []
@@ -517,6 +533,8 @@ class LoggingCallback(BaseCallback):
 						chunk_target = schedule.get("chunk_target", np.array([]))
 						difficulty = schedule.get("difficulty", np.array([]))
 						prior_u = schedule.get("difficulty_prior_u", np.array([]))
+						source_score = schedule.get("difficulty_source_score", np.array([]))
+						prior_source_score = schedule.get("difficulty_prior_source_score", np.array([]))
 						n = min(len(active), len(steps), len(chunk_requested), len(info))
 						if n > 0:
 							active_n = active[:n]
@@ -526,6 +544,8 @@ class LoggingCallback(BaseCallback):
 							chunk_target_n = np.asarray(chunk_target[:n], dtype=np.float32) if len(chunk_target) >= n else chunk_req_n
 							difficulty_n = np.asarray(difficulty[:n], dtype=np.float32) if len(difficulty) >= n else np.zeros(n, dtype=np.float32)
 							prior_u_n = np.asarray(prior_u[:n], dtype=np.float32) if len(prior_u) >= n else np.zeros(n, dtype=np.float32)
+							source_score_n = np.asarray(source_score[:n], dtype=np.float32) if len(source_score) >= n else np.zeros(n, dtype=np.float32)
+							prior_source_score_n = np.asarray(prior_source_score[:n], dtype=np.float32) if len(prior_source_score) >= n else np.zeros(n, dtype=np.float32)
 							chunk_exec_n = np.asarray([
 								float(info_j.get('chunk_exec', chunk_req_n[idx]))
 								for idx, info_j in enumerate(info[:n])
@@ -540,6 +560,8 @@ class LoggingCallback(BaseCallback):
 								chunk_target_a = chunk_target_n[active_n]
 								difficulty_a = difficulty_n[active_n]
 								prior_u_a = prior_u_n[active_n]
+								source_score_a = source_score_n[active_n]
+								prior_source_score_a = prior_source_score_n[active_n]
 								req_nfe_a = steps_a / np.maximum(chunk_req_a, 1.0)
 								exec_nfe_a = steps_a / np.maximum(chunk_exec_a, 1.0)
 								eval_steps_sum += float(np.sum(steps_a))
@@ -558,6 +580,8 @@ class LoggingCallback(BaseCallback):
 								eval_executed_nfe_values.extend(exec_nfe_a.tolist())
 								eval_difficulty_values.extend(difficulty_a.tolist())
 								eval_prior_u_values.extend(prior_u_a.tolist())
+								eval_source_score_values.extend(source_score_a.tolist())
+								eval_prior_source_score_values.extend(prior_source_score_a.tolist())
 								eval_query_idx_values.extend([float(query_idx)] * int(np.sum(active_n)))
 								for env_idx in np.flatnonzero(active_n):
 									step_v = float(steps_n[env_idx])
@@ -567,6 +591,7 @@ class LoggingCallback(BaseCallback):
 									chunk_exec_v = float(max(chunk_exec_n[env_idx], 1.0))
 									diff_v = float(difficulty_n[env_idx])
 									prior_u_v = float(prior_u_n[env_idx])
+									source_score_v = float(source_score_n[env_idx])
 									req_nfe_v = step_v / max(chunk_req_v, 1.0)
 									exec_nfe_v = step_v / max(chunk_exec_v, 1.0)
 									query_steps.setdefault(query_idx, []).append(step_v)
@@ -581,8 +606,8 @@ class LoggingCallback(BaseCallback):
 									query_prior_u.setdefault(query_idx, []).append(prior_u_v)
 									query_schedule_rows.append([
 										int(i), int(env_idx), int(query_idx), int(step_start_n[env_idx]), int(step_end_n[env_idx]),
-										step_target_v, step_v, chunk_target_v, chunk_req_v, chunk_exec_v,
-										req_nfe_v, exec_nfe_v, diff_v, prior_u_v, int(done[env_idx]), int(success_i[env_idx]),
+										step_target_v, step_v, chunk_target_v, chunk_req_v, req_nfe_v,
+										diff_v, prior_u_v, source_score_v, int(done[env_idx]), int(success_i[env_idx]),
 									])
 							env_step_i[:n] = np.where(active_n, step_end_n, env_step_i[:n])
 					if np.all(done_i):
@@ -684,6 +709,12 @@ class LoggingCallback(BaseCallback):
 						"adapt_spearman_difficulty_chunk_requested": self._safe_corr(eval_difficulty_values, eval_chunk_requested_values, spearman=True),
 						"adapt_spearman_difficulty_chunk_executed": self._safe_corr(eval_difficulty_values, eval_chunk_exec_values, spearman=True),
 						"adapt_pearson_difficulty_nfe_executed": self._safe_corr(eval_difficulty_values, eval_executed_nfe_values, spearman=False),
+						"adapt_spearman_source_steps": self._safe_corr(eval_source_score_values, eval_steps_values, spearman=True),
+						"adapt_spearman_source_nfe_requested": self._safe_corr(eval_source_score_values, eval_requested_nfe_values, spearman=True),
+						"adapt_spearman_source_difficulty": self._safe_corr(eval_source_score_values, eval_difficulty_values, spearman=True),
+						"adapt_pearson_source_steps": self._safe_corr(eval_source_score_values, eval_steps_values, spearman=False),
+						"adapt_pearson_source_nfe_requested": self._safe_corr(eval_source_score_values, eval_requested_nfe_values, spearman=False),
+						"adapt_spearman_prior_source_steps": self._safe_corr(eval_prior_source_score_values, eval_steps_values, spearman=True),
 						"adapt_spearman_prior_nfe_executed": self._safe_corr(eval_prior_u_values, eval_executed_nfe_values, spearman=True),
 						"adapt_spearman_query_idx_nfe_executed": self._safe_corr(eval_query_idx_values, eval_executed_nfe_values, spearman=True),
 					}
@@ -703,20 +734,13 @@ class LoggingCallback(BaseCallback):
 					self._add_distribution_metrics(eval_table_metrics, "dist_chunk_executed", eval_chunk_exec_values)
 					self._add_distribution_metrics(eval_table_metrics, "dist_nfe_requested", eval_requested_nfe_values)
 					self._add_distribution_metrics(eval_table_metrics, "dist_nfe_executed", eval_executed_nfe_values)
+					self._add_distribution_metrics(eval_table_metrics, "dist_difficulty", eval_difficulty_values)
+					self._add_distribution_metrics(eval_table_metrics, "dist_difficulty_source_score", eval_source_score_values)
+					self._add_distribution_metrics(eval_table_metrics, "dist_difficulty_prior_source_score", eval_prior_source_score_values)
 					self._add_distribution_metrics(eval_table_metrics, "dist_episode_nfe_executed", episode_executed_nfe_arr)
 					elastic_payload = {
-						"eval/avg_denoising_steps": elastic_stats.get("avg_steps", 0.0),
-						"eval/avg_chunk_size": elastic_stats.get("avg_chunk", 0.0),
-						"eval/avg_denoising_steps_target": elastic_stats.get("avg_steps_target", 0.0),
-						"eval/avg_chunk_size_target": elastic_stats.get("avg_chunk_target", 0.0),
-						"eval/target_exec_mismatch_steps": elastic_stats.get("target_exec_mismatch_steps", 0.0),
-						"eval/target_exec_mismatch_chunk": elastic_stats.get("target_exec_mismatch_chunk", 0.0),
-						"eval/avg_difficulty_abs": elastic_stats.get("avg_difficulty_abs", 0.0),
-						"eval/avg_difficulty_prior_u_abs": elastic_stats.get("avg_difficulty_prior_u_abs", 0.0),
-						"evaluation/requested_nfe_amortized": requested_nfe,
-						"evaluation/nfe_amortized": executed_nfe,
-						"evaluation/chunk_requested_mean": float(np.mean(eval_chunk_requested_values)) if len(eval_chunk_requested_values) > 0 else 0.0,
-						"evaluation/chunk_exec_mean": float(np.mean(eval_chunk_exec_values)) if len(eval_chunk_exec_values) > 0 else 0.0,
+						"eval/source_score_mean": elastic_stats.get("avg_difficulty_source_score", 0.0),
+						"eval/source_score_std": elastic_stats.get("std_difficulty_source_score", 0.0),
 					}
 					elastic_payload.update({
 						f"eval_table/{key}": value
@@ -724,56 +748,54 @@ class LoggingCallback(BaseCallback):
 						if isinstance(value, (int, float, np.integer, np.floating))
 					})
 					elastic_payload["eval_table/summary"] = self._build_eval_summary_table(eval_table_metrics)
-					query_idx_keys = sorted(query_steps.keys())
-					if query_idx_keys:
-						def _query_mean(bucket, q_idx):
-							values = np.asarray(bucket.get(q_idx, []), dtype=np.float32)
-							return float(np.mean(values)) if values.size > 0 else 0.0
-						query_idx_schedule_table = wandb.Table(
-							data=[
-								[
-									int(q_idx),
-									_query_mean(query_steps_target, q_idx),
-									_query_mean(query_steps, q_idx),
-									_query_mean(query_chunk_target, q_idx),
-									_query_mean(query_chunk_requested, q_idx),
-									_query_mean(query_chunk_exec, q_idx),
-									_query_mean(query_requested_nfe, q_idx),
-									_query_mean(query_executed_nfe, q_idx),
-									_query_mean(query_difficulty, q_idx),
-									_query_mean(query_difficulty_abs, q_idx),
-									_query_mean(query_prior_u, q_idx),
-									len(query_steps.get(q_idx, [])),
-								]
-								for q_idx in query_idx_keys
-							],
-							columns=[
-								"query_idx", "steps_target_mean", "steps_exec_mean", "chunk_target_mean",
-								"chunk_requested_mean", "chunk_exec_mean", "requested_nfe_mean",
-								"executed_nfe_mean", "difficulty_mean", "difficulty_abs_mean",
-								"difficulty_prior_u_mean", "count",
-							],
-						)
-						elastic_payload["eval/query_idx_schedule_table"] = query_idx_schedule_table
-						elastic_payload["eval_table/query_idx_schedule_table"] = query_idx_schedule_table
-						elastic_payload["eval/query_idx_steps_exec"] = wandb.plot.line(query_idx_schedule_table, "query_idx", "steps_exec_mean", title="Denoising Steps by Query Index")
-						elastic_payload["eval/query_idx_chunk_requested"] = wandb.plot.line(query_idx_schedule_table, "query_idx", "chunk_requested_mean", title="Requested Chunk by Query Index")
-						elastic_payload["eval/query_idx_requested_nfe"] = wandb.plot.line(query_idx_schedule_table, "query_idx", "requested_nfe_mean", title="Requested NFE by Query Index")
-						elastic_payload["eval/query_idx_executed_nfe"] = wandb.plot.line(query_idx_schedule_table, "query_idx", "executed_nfe_mean", title="Executed NFE by Query Index")
-						elastic_payload["eval/query_idx_difficulty"] = wandb.plot.line(query_idx_schedule_table, "query_idx", "difficulty_mean", title="Difficulty by Query Index")
-						elastic_payload["eval/query_idx_difficulty_abs"] = wandb.plot.line(query_idx_schedule_table, "query_idx", "difficulty_abs_mean", title="Difficulty Magnitude by Query Index")
-						elastic_payload["eval_table/query_idx_executed_nfe"] = wandb.plot.line(query_idx_schedule_table, "query_idx", "executed_nfe_mean", title="Executed NFE by Query Index")
-						elastic_payload["eval_table/query_idx_difficulty_abs"] = wandb.plot.line(query_idx_schedule_table, "query_idx", "difficulty_abs_mean", title="Difficulty Magnitude by Query Index")
 					if query_schedule_rows:
+						query_schedule_columns = [
+							"episode_id", "env_id", "query_idx", "env_step_start", "env_step_end",
+							"steps_target", "steps_exec", "chunk_target", "chunk_requested",
+							"requested_nfe", "difficulty", "difficulty_prior_u",
+							"difficulty_source_score", "done_after_query", "success_so_far",
+						]
 						elastic_payload["eval/query_schedule_table"] = wandb.Table(
 							data=query_schedule_rows,
-							columns=[
-								"episode_id", "env_id", "query_idx", "env_step_start", "env_step_end",
-								"steps_target", "steps_exec", "chunk_target", "chunk_requested",
-								"chunk_exec", "requested_nfe", "executed_nfe", "difficulty",
-								"difficulty_prior_u", "done_after_query", "success_so_far",
-							],
+							columns=query_schedule_columns,
 						)
+						traces = {}
+						for row in query_schedule_rows:
+							traces.setdefault((row[0], row[1]), []).append(row)
+						selected_trace = None
+						selected_success = 0.0
+						for trace_key in sorted(traces.keys()):
+							trace_rows = sorted(traces[trace_key], key=lambda row: row[2])
+							if any(row[14] for row in trace_rows):
+								selected_trace = trace_rows
+								selected_success = 1.0
+								break
+						if selected_trace is None and traces:
+							trace_key = sorted(traces.keys())[0]
+							selected_trace = sorted(traces[trace_key], key=lambda row: row[2])
+						if selected_trace:
+							trace_table = wandb.Table(
+								data=[
+									[
+										int(row[2]), int(row[3]), int(row[4]),
+										float(row[6]), float(row[8]), float(row[9]),
+										float(row[10]), float(row[12]),
+									]
+									for row in selected_trace
+								],
+								columns=[
+									"query_idx", "env_step_start", "env_step_end",
+									"steps_exec", "chunk_requested", "requested_nfe",
+									"difficulty", "difficulty_source_score",
+								],
+							)
+							elastic_payload["eval/trace_success"] = selected_success
+							elastic_payload["eval/trace_schedule_table"] = trace_table
+							elastic_payload["eval/trace_steps_exec"] = wandb.plot.line(trace_table, "query_idx", "steps_exec", title="Denoising Steps by Query")
+							elastic_payload["eval/trace_chunk_requested"] = wandb.plot.line(trace_table, "query_idx", "chunk_requested", title="Requested Chunk by Query")
+							elastic_payload["eval/trace_requested_nfe"] = wandb.plot.line(trace_table, "query_idx", "requested_nfe", title="Requested NFE by Query")
+							elastic_payload["eval/trace_difficulty"] = wandb.plot.line(trace_table, "query_idx", "difficulty", title="Difficulty by Query")
+							elastic_payload["eval/trace_source_score"] = wandb.plot.line(trace_table, "query_idx", "difficulty_source_score", title="Raw Difficulty Source by Query")
 					wandb.log(elastic_payload, step=self.log_count)
 			self._log_eval_video(agent)
 
