@@ -78,6 +78,16 @@ def main(cfg: OmegaConf):
 			save_code=True,
 			config=OmegaConf.to_container(cfg, resolve=True),
 		)
+		# Keep existing eval curves on W&B _step and add an explicit env-timestep x-axis.
+		wandb.define_metric("eval_by_timesteps/timesteps")
+		wandb.define_metric(
+			"eval_by_timesteps/success_rate",
+			step_metric="eval_by_timesteps/timesteps",
+		)
+		wandb.define_metric(
+			"eval_by_timesteps/reward",
+			step_metric="eval_by_timesteps/timesteps",
+		)
 
 	MAX_STEPS = int(cfg.env.max_episode_steps / cfg.act_steps)
 
