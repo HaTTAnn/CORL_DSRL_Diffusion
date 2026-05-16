@@ -97,6 +97,8 @@ RANGE_OPEN_RATE="${RANGE_OPEN_RATE:-0.10}"
 RANGE_CLOSE_RATE="${RANGE_CLOSE_RATE:-0.04}"
 ENABLE_CHUNK_ELASTICITY="${ENABLE_CHUNK_ELASTICITY:-true}"
 STOCHASTIC_ROUNDING="${STOCHASTIC_ROUNDING:-false}"
+MIN_DENOISING_STEPS="${MIN_DENOISING_STEPS:-3}"
+MAX_DENOISING_STEPS="${MAX_DENOISING_STEPS:-8}"
 DIFFICULTY_PRIOR_START_STEP="${DIFFICULTY_PRIOR_START_STEP:-35000}"
 DIFFICULTY_PRIOR_WARMUP_STEPS="${DIFFICULTY_PRIOR_WARMUP_STEPS:-50000}"
 DIFFICULTY_START_STEP="${DIFFICULTY_START_STEP:-40000}"
@@ -207,7 +209,7 @@ echo "python: $(which python)"
 echo "run=${RUN_NAME} gpu=${GPU} task=${TASK} seed=${SEED} variant=${VARIANT}"
 echo "target_env_timesteps=${TARGET_ENV_TIMESTEPS} eval_envs=${N_EVAL_ENVS} eval_rollouts=${NUM_EVALS}"
 echo "difficulty: prior_mode=${DIFFICULTY_PRIOR_SIGNAL_MODE}, loss_mode=${DIFFICULTY_SIGNAL_MODE}, prior_scale=${DIFFICULTY_PRIOR_SCALE}, prior_signal_scale=${DIFFICULTY_PRIOR_SIGNAL_SCALE}, loss_signal_scale=${DIFFICULTY_SIGNAL_SCALE}"
-echo "step/chunk: easy_steps=${DIFFICULTY_EASY_STEPS_TARGET}, hard_steps=${DIFFICULTY_HARD_STEPS_TARGET}, easy_chunk=${DIFFICULTY_EASY_CHUNK_TARGET}, hard_chunk=${DIFFICULTY_HARD_CHUNK_TARGET}, preprior=${PREPRIOR_RESIDUAL_SCALE}, residual=${SCHEDULE_RESIDUAL_SCALE}"
+echo "step/chunk: range=${MIN_DENOISING_STEPS}..${MAX_DENOISING_STEPS}, easy_steps=${DIFFICULTY_EASY_STEPS_TARGET}, hard_steps=${DIFFICULTY_HARD_STEPS_TARGET}, easy_chunk=${DIFFICULTY_EASY_CHUNK_TARGET}, hard_chunk=${DIFFICULTY_HARD_CHUNK_TARGET}, preprior=${PREPRIOR_RESIDUAL_SCALE}, residual=${SCHEDULE_RESIDUAL_SCALE}"
 echo "loss: weight=${DIFFICULTY_WEIGHT}, mode_margin=${DIFFICULTY_MODE_MARGIN_WEIGHT}, quantile=${DIFFICULTY_QUANTILE_HINGE_WEIGHT}"
 echo "cost: band=[${NFE_TARGET_LOWER},${NFE_TARGET_UPPER}], target=${TARGET_NFE}, lambda=${ACTOR_COMPUTE_LAMBDA_WARMUP}->${ACTOR_COMPUTE_LAMBDA}"
 
@@ -229,8 +231,8 @@ python train_dsrl.py --config-name "dsrl_${TASK}.yaml" \
   ++train.target_env_timesteps="$TARGET_ENV_TIMESTEPS" \
   ++train.enable_three_head=true \
   ++train.schedule_heads_after="$SCHEDULE_HEADS_AFTER" \
-  ++train.min_denoising_steps=3 \
-  ++train.max_denoising_steps=8 \
+  ++train.min_denoising_steps="$MIN_DENOISING_STEPS" \
+  ++train.max_denoising_steps="$MAX_DENOISING_STEPS" \
   ++train.min_chunk_size=1 \
   ++train.max_chunk_size=4 \
   ++train.fixed_denoising_steps=8 \

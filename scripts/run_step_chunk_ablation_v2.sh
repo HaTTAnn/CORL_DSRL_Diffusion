@@ -130,6 +130,8 @@ for i in "${!JOBS[@]}"; do
 
   case "$arm" in
     weak_chunk)
+      min_steps=3
+      max_steps=8
       easy_steps=3
       hard_steps=8
       easy_chunk=4
@@ -140,6 +142,8 @@ for i in "${!JOBS[@]}"; do
       nfe_upper_square=1.95
       ;;
     both_explore)
+      min_steps=3
+      max_steps=8
       easy_steps=3
       hard_steps=8
       easy_chunk=4
@@ -150,8 +154,10 @@ for i in "${!JOBS[@]}"; do
       nfe_upper_square=1.95
       ;;
     step_only)
+      min_steps=3
+      max_steps=15
       easy_steps=3
-      hard_steps=8
+      hard_steps=15
       easy_chunk=4
       hard_chunk=4
       chunk_elastic=false
@@ -187,6 +193,8 @@ for i in "${!JOBS[@]}"; do
   cmd+=" export WANDB_GROUP_PREFIX='$group_prefix';"
   cmd+=" export WANDB_MODE='${WANDB_MODE:-online}';"
   cmd+=" export WANDB_PROJECT='${WANDB_PROJECT:-DSRL_robomimic}';"
+  cmd+=" export MIN_DENOISING_STEPS='$min_steps';"
+  cmd+=" export MAX_DENOISING_STEPS='$max_steps';"
   cmd+=" export DIFFICULTY_EASY_STEPS_TARGET='$easy_steps';"
   cmd+=" export DIFFICULTY_HARD_STEPS_TARGET='$hard_steps';"
   cmd+=" export DIFFICULTY_EASY_CHUNK_TARGET='$easy_chunk';"
@@ -215,7 +223,7 @@ for i in "${!JOBS[@]}"; do
   append_export_if_set NUM_EVALS
   append_export_if_set EVAL_VIDEO
   cmd+=" echo '=== start job index=${i} arm=${arm} task=${task} seed=${seed} signal=${SIGNAL_VARIANT} gpu=${gpu} ===';"
-  cmd+=" echo 'arm config: steps=${easy_steps}->${hard_steps} chunk=${easy_chunk}->${hard_chunk} chunk_elastic=${chunk_elastic} stochastic=${stochastic_rounding} nfe=[${nfe_lower},${nfe_upper}] target=${target_nfe}';"
+  cmd+=" echo 'arm config: range=${min_steps}..${max_steps} steps=${easy_steps}->${hard_steps} chunk=${easy_chunk}->${hard_chunk} chunk_elastic=${chunk_elastic} stochastic=${stochastic_rounding} nfe=[${nfe_lower},${nfe_upper}] target=${target_nfe}';"
   cmd+=" bash scripts/launch_step_difficulty_h20.sh '${task}' '${gpu}' '${seed}' '${label}' '${SIGNAL_VARIANT}' 2>&1 | tee '${log}';"
   cmd+=" echo '=== finished job index=${i} arm=${arm} task=${task} seed=${seed} ===';"
 
