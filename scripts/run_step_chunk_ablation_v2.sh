@@ -5,14 +5,12 @@ set -euo pipefail
 #   weak_chunk:    steps 3..8, chunk elastic but weak (4 -> 3.75)
 #   both_explore:  steps 3..8, chunk fully elastic (4 -> 3)
 #   step_only:     steps 3..8, chunk fixed at 4
-#   dsrl_baseline: official DSRL baseline from /root/storage/CODE/txy/dsrl
+#   dsrl_baseline: fixed DSRL baseline in this repo (8 denoise steps / chunk 4)
 
 PLAN="${1:-12}"
 GPUS_CSV="${2:-${GPUS:-0,1,2,3,4,5,6,7}}"
 ENV_LABEL="${3:-${ENV_LABEL:-uv}}"
 SIGNAL_VARIANT="${SIGNAL_VARIANT:-advz_strong}"
-BASELINE_ROOT="${DSRL_BASELINE_ROOT:-/root/storage/CODE/txy/dsrl}"
-BASELINE_PYTHON="${BASELINE_PYTHON:-python3}"
 BASELINE_USE_TARGET_ENV_STOP="${BASELINE_USE_TARGET_ENV_STOP:-1}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
@@ -107,7 +105,6 @@ fi
 
 echo "step/chunk ablation v2 plan=$PLAN signal=${SIGNAL_VARIANT} gpus=${GPUS_CSV} env=${ENV_LABEL} tag=${BASE_RUN_TAG}"
 echo "project root: $PROJECT_ROOT"
-echo "baseline root: $BASELINE_ROOT"
 echo "logs: $LOG_DIR"
 echo "wandb project: ${WANDB_PROJECT:-DSRL_robomimic}"
 echo "wandb group prefix base: $WANDB_GROUP_PREFIX_BASE"
@@ -231,8 +228,7 @@ for i in "${!JOBS[@]}"; do
 
   if [[ "$arm" == "dsrl_baseline" ]]; then
     run_tag="${BASE_RUN_TAG}_${arm}"
-    group_prefix="${WANDB_GROUP_PREFIX_BASE}_${arm}_${task}_${BASE_RUN_TAG}"
-    baseline_run_name="${task}_dsrl_baseline_seed${seed}_${ENV_LABEL}_${BASE_RUN_TAG}"
+    group_prefix="${WANDB_GROUP_PREFIX_BASE}_${arm}"
     baseline_target_env_steps="$target_env_steps"
     if [[ "$task" == "can" ]]; then
       baseline_target_env_steps="${BASELINE_TARGET_ENV_TIMESTEPS_CAN:-$target_env_steps}"
@@ -240,33 +236,35 @@ for i in "${!JOBS[@]}"; do
       baseline_target_env_steps="${BASELINE_TARGET_ENV_TIMESTEPS_SQUARE:-$target_env_steps}"
     fi
 
-    baseline_overrides="seed='${seed}' device='cuda:0' use_wandb=True wandb.project='${WANDB_PROJECT:-DSRL_robomimic}' wandb.group='${group_prefix}' name='${baseline_run_name}' log_dir='./logs_stepchunk_baseline'"
-    if [[ "$BASELINE_USE_TARGET_ENV_STOP" == "1" && "$baseline_target_env_steps" != "0" ]]; then
-      baseline_overrides+=" ++train.target_env_timesteps='${baseline_target_env_steps}'"
-    fi
-
     cmd="set -euo pipefail;"
-    cmd+=" cd '$BASELINE_ROOT';"
-    cmd+=" export CUDA_VISIBLE_DEVICES='$gpu';"
-    cmd+=" export MUJOCO_GL='${MUJOCO_GL:-egl}';"
-    cmd+=" export PYTHONUNBUFFERED=1;"
-    cmd+=" export HYDRA_FULL_ERROR=1;"
-    cmd+=" export WANDB__SERVICE_WAIT=300;"
+    cmd+=" cd '$PROJECT_ROOT';"
+    cmd+=" export RUN_TAG='$run_tag';"
+    cmd+=" export WANDB_GROUP_PREFIX='$group_prefix';"
     cmd+=" export WANDB_MODE='${WANDB_MODE:-online}';"
+    cmd+=" export WANDB_PROJECT='${WANDB_PROJECT:-DSRL_robomimic}';"
+    cmd+=" export TARGET_ENV_TIMESTEPS='$baseline_target_env_steps';"
+    cmd+=" export BASELINE_USE_TARGET_ENV_STOP='$BASELINE_USE_TARGET_ENV_STOP';"
     cmd+=" export OMP_NUM_THREADS='${OMP_NUM_THREADS:-1}';"
     cmd+=" export MKL_NUM_THREADS='${MKL_NUM_THREADS:-1}';"
     cmd+=" export OPENBLAS_NUM_THREADS='${OPENBLAS_NUM_THREADS:-1}';"
     cmd+=" export NUMEXPR_NUM_THREADS='${NUMEXPR_NUM_THREADS:-1}';"
-    cmd+=" export PYTHONPATH='$BASELINE_ROOT:$BASELINE_ROOT/dppo:$BASELINE_ROOT/stable-baselines3:\${PYTHONPATH:-}';"
+    append_export_if_set BASELINE_SAVE_CHECKPOINT
+    append_export_if_set BASELINE_CAN_UTD
+    append_export_if_set BASELINE_CAN_INIT_ROLLOUT_STEPS
+    append_export_if_set BASELINE_SQUARE_UTD
+    append_export_if_set BASELINE_SQUARE_INIT_ROLLOUT_STEPS
     append_export_if_set WANDB_API_KEY
     append_export_if_set WANDB_ENTITY
     append_export_if_set WANDB_BASE_URL
     append_export_if_set WANDB_DIR
     append_export_if_set WANDB_CACHE_DIR
     append_export_if_set WANDB_CONFIG_DIR
+    append_export_if_set N_EVAL_ENVS
+    append_export_if_set NUM_EVALS
+    append_export_if_set EVAL_VIDEO
     cmd+=" echo '=== start job index=${i} arm=${arm} task=${task} seed=${seed} signal=official gpu=${gpu} ===';"
-    cmd+=" echo 'baseline root=${BASELINE_ROOT} official defaults, target_env_timesteps=${baseline_target_env_steps}, target_stop=${BASELINE_USE_TARGET_ENV_STOP}';"
-    cmd+=" ${BASELINE_PYTHON} train_dsrl.py --config-name 'dsrl_${task}.yaml' ${baseline_overrides} 2>&1 | tee '${log}';"
+    cmd+=" echo 'baseline config: fixed 8/4 in current repo, target_env_timesteps=${baseline_target_env_steps}, target_stop=${BASELINE_USE_TARGET_ENV_STOP}';"
+    cmd+=" bash scripts/launch_dsrl_baseline.sh '${task}' '${gpu}' '${seed}' '${ENV_LABEL}_${arm}' 2>&1 | tee '${log}';"
     cmd+=" echo '=== finished job index=${i} arm=${arm} task=${task} seed=${seed} ===';"
   else
     cmd="set -euo pipefail;"
