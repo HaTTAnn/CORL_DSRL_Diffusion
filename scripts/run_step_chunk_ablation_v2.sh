@@ -5,13 +5,11 @@ set -euo pipefail
 #   weak_chunk:    steps 3..8, chunk elastic but weak (4 -> 3.75)
 #   both_explore:  steps 3..8, chunk fully elastic (4 -> 3)
 #   step_only:     steps 3..8, chunk fixed at 4
-#   dsrl_baseline: fixed DSRL baseline in this repo (8 denoise steps / chunk 4)
 
 PLAN="${1:-12}"
 GPUS_CSV="${2:-${GPUS:-0,1,2,3,4,5,6,7}}"
 ENV_LABEL="${3:-${ENV_LABEL:-uv}}"
 SIGNAL_VARIANT="${SIGNAL_VARIANT:-advz_strong}"
-BASELINE_USE_TARGET_ENV_STOP="${BASELINE_USE_TARGET_ENV_STOP:-1}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd -P)"
@@ -35,23 +33,11 @@ if [[ "${#GPUS[@]}" -lt 1 ]]; then
 fi
 
 case "$PLAN" in
-  16)
-    TASKS=(can square)
-    SEEDS=(0 1)
-    ARMS=(weak_chunk both_explore step_only dsrl_baseline)
-    EXPECTED=16
-    ;;
   12)
     TASKS=(can square)
     SEEDS=(0 1)
     ARMS=(weak_chunk both_explore step_only)
     EXPECTED=12
-    ;;
-  square8)
-    TASKS=(square)
-    SEEDS=(0 1)
-    ARMS=(weak_chunk both_explore step_only dsrl_baseline)
-    EXPECTED=8
     ;;
   square6)
     TASKS=(square)
@@ -59,30 +45,17 @@ case "$PLAN" in
     ARMS=(weak_chunk both_explore step_only)
     EXPECTED=6
     ;;
-  baseline4)
-    TASKS=(can square)
-    SEEDS=(0 1)
-    ARMS=(dsrl_baseline)
-    EXPECTED=4
-    ;;
   smoke)
     TASKS=(square)
     SEEDS=(0)
     ARMS=(weak_chunk)
     EXPECTED=1
     ;;
-  smoke_baseline)
-    TASKS=(square)
-    SEEDS=(0)
-    ARMS=(dsrl_baseline)
-    EXPECTED=1
-    ;;
   *)
-    echo "usage: $0 [16|12|square8|square6|baseline4|smoke|smoke_baseline] [gpu_csv] [env_label]" >&2
+    echo "usage: $0 [12|square6|smoke] [gpu_csv] [env_label]" >&2
     echo "examples:" >&2
-    echo "  DRY_RUN=1 SIGNAL_VARIANT=advz_strong $0 square8 0,1,3 uv" >&2
-    echo "  RUN_TAG=stepchunk_v2_advz SIGNAL_VARIANT=advz_strong $0 16 0,1,2,3,4,5,6,7 uv" >&2
-    echo "  RUN_TAG=stepchunk_v2_advz $0 baseline4 0,1,3,7 uv" >&2
+    echo "  DRY_RUN=1 SIGNAL_VARIANT=advz_strong $0 square6 0,1,3 uv" >&2
+    echo "  RUN_TAG=stepchunk_v2_advz SIGNAL_VARIANT=advz_strong $0 12 0,1,2,3,4,5,6,7 uv" >&2
     exit 2
     ;;
 esac
@@ -120,14 +93,10 @@ for i in "${!JOBS[@]}"; do
   gpu_idx=$((i % ${#GPUS[@]}))
   gpu="${GPUS[$gpu_idx]}"
   GPU_COUNTS[$gpu_idx]=$(( ${GPU_COUNTS[$gpu_idx]:-0} + 1 ))
-  signal_label="$SIGNAL_VARIANT"
-  if [[ "$arm" == "dsrl_baseline" ]]; then
-    signal_label="official"
-  fi
-  session="dsrl_stepchunk_v2_j$(printf '%02d' "$i")_g${gpu}_${arm}_${task}_s${seed}_${signal_label}_${BASE_RUN_TAG}"
-  log="$LOG_DIR/${BASE_RUN_TAG}_j$(printf '%02d' "$i")_${arm}_${task}_${signal_label}_seed${seed}_gpu${gpu}.log"
+  session="dsrl_stepchunk_v2_j$(printf '%02d' "$i")_g${gpu}_${arm}_${task}_s${seed}_${SIGNAL_VARIANT}_${BASE_RUN_TAG}"
+  log="$LOG_DIR/${BASE_RUN_TAG}_j$(printf '%02d' "$i")_${arm}_${task}_${SIGNAL_VARIANT}_seed${seed}_gpu${gpu}.log"
   SESSIONS+=("$session")
-  printf '%02d gpu=%s arm=%s task=%s seed=%s signal=%s session=%s log=%s\n' "$i" "$gpu" "$arm" "$task" "$seed" "$signal_label" "$session" "$log"
+  printf '%02d gpu=%s arm=%s task=%s seed=%s signal=%s session=%s log=%s\n' "$i" "$gpu" "$arm" "$task" "$seed" "$SIGNAL_VARIANT" "$session" "$log"
 done
 
 echo
@@ -157,11 +126,7 @@ for i in "${!JOBS[@]}"; do
   read -r arm task seed <<< "${JOBS[$i]}"
   gpu="${GPUS[$((i % ${#GPUS[@]}))]}"
   session="${SESSIONS[$i]}"
-  signal_label="$SIGNAL_VARIANT"
-  if [[ "$arm" == "dsrl_baseline" ]]; then
-    signal_label="official"
-  fi
-  log="$LOG_DIR/${BASE_RUN_TAG}_j$(printf '%02d' "$i")_${arm}_${task}_${signal_label}_seed${seed}_gpu${gpu}.log"
+  log="$LOG_DIR/${BASE_RUN_TAG}_j$(printf '%02d' "$i")_${arm}_${task}_${SIGNAL_VARIANT}_seed${seed}_gpu${gpu}.log"
 
   case "$arm" in
     weak_chunk)
@@ -194,16 +159,6 @@ for i in "${!JOBS[@]}"; do
       nfe_upper_can=1.95
       nfe_upper_square=1.95
       ;;
-    dsrl_baseline)
-      easy_steps=8
-      hard_steps=8
-      easy_chunk=4
-      hard_chunk=4
-      chunk_elastic=false
-      stochastic_rounding=false
-      nfe_upper_can=2.00
-      nfe_upper_square=2.00
-      ;;
     *)
       echo "unknown arm: $arm" >&2
       exit 6
@@ -226,85 +181,43 @@ for i in "${!JOBS[@]}"; do
   group_prefix="${WANDB_GROUP_PREFIX_BASE}_${arm}"
   label="${ENV_LABEL}_${arm}"
 
-  if [[ "$arm" == "dsrl_baseline" ]]; then
-    run_tag="${BASE_RUN_TAG}_${arm}"
-    group_prefix="${WANDB_GROUP_PREFIX_BASE}_${arm}"
-    baseline_target_env_steps="$target_env_steps"
-    if [[ "$task" == "can" ]]; then
-      baseline_target_env_steps="${BASELINE_TARGET_ENV_TIMESTEPS_CAN:-$target_env_steps}"
-    else
-      baseline_target_env_steps="${BASELINE_TARGET_ENV_TIMESTEPS_SQUARE:-$target_env_steps}"
-    fi
-
-    cmd="set -euo pipefail;"
-    cmd+=" cd '$PROJECT_ROOT';"
-    cmd+=" export RUN_TAG='$run_tag';"
-    cmd+=" export WANDB_GROUP_PREFIX='$group_prefix';"
-    cmd+=" export WANDB_MODE='${WANDB_MODE:-online}';"
-    cmd+=" export WANDB_PROJECT='${WANDB_PROJECT:-DSRL_robomimic}';"
-    cmd+=" export TARGET_ENV_TIMESTEPS='$baseline_target_env_steps';"
-    cmd+=" export BASELINE_USE_TARGET_ENV_STOP='$BASELINE_USE_TARGET_ENV_STOP';"
-    cmd+=" export OMP_NUM_THREADS='${OMP_NUM_THREADS:-1}';"
-    cmd+=" export MKL_NUM_THREADS='${MKL_NUM_THREADS:-1}';"
-    cmd+=" export OPENBLAS_NUM_THREADS='${OPENBLAS_NUM_THREADS:-1}';"
-    cmd+=" export NUMEXPR_NUM_THREADS='${NUMEXPR_NUM_THREADS:-1}';"
-    append_export_if_set BASELINE_SAVE_CHECKPOINT
-    append_export_if_set BASELINE_CAN_UTD
-    append_export_if_set BASELINE_CAN_INIT_ROLLOUT_STEPS
-    append_export_if_set BASELINE_SQUARE_UTD
-    append_export_if_set BASELINE_SQUARE_INIT_ROLLOUT_STEPS
-    append_export_if_set WANDB_API_KEY
-    append_export_if_set WANDB_ENTITY
-    append_export_if_set WANDB_BASE_URL
-    append_export_if_set WANDB_DIR
-    append_export_if_set WANDB_CACHE_DIR
-    append_export_if_set WANDB_CONFIG_DIR
-    append_export_if_set N_EVAL_ENVS
-    append_export_if_set NUM_EVALS
-    append_export_if_set EVAL_VIDEO
-    cmd+=" echo '=== start job index=${i} arm=${arm} task=${task} seed=${seed} signal=official gpu=${gpu} ===';"
-    cmd+=" echo 'baseline config: fixed 8/4 in current repo, target_env_timesteps=${baseline_target_env_steps}, target_stop=${BASELINE_USE_TARGET_ENV_STOP}';"
-    cmd+=" bash scripts/launch_dsrl_baseline.sh '${task}' '${gpu}' '${seed}' '${ENV_LABEL}_${arm}' 2>&1 | tee '${log}';"
-    cmd+=" echo '=== finished job index=${i} arm=${arm} task=${task} seed=${seed} ===';"
-  else
-    cmd="set -euo pipefail;"
-    cmd+=" cd '$PROJECT_ROOT';"
-    cmd+=" export RUN_TAG='$run_tag';"
-    cmd+=" export WANDB_GROUP_PREFIX='$group_prefix';"
-    cmd+=" export WANDB_MODE='${WANDB_MODE:-online}';"
-    cmd+=" export WANDB_PROJECT='${WANDB_PROJECT:-DSRL_robomimic}';"
-    cmd+=" export DIFFICULTY_EASY_STEPS_TARGET='$easy_steps';"
-    cmd+=" export DIFFICULTY_HARD_STEPS_TARGET='$hard_steps';"
-    cmd+=" export DIFFICULTY_EASY_CHUNK_TARGET='$easy_chunk';"
-    cmd+=" export DIFFICULTY_HARD_CHUNK_TARGET='$hard_chunk';"
-    cmd+=" export ENABLE_CHUNK_ELASTICITY='$chunk_elastic';"
-    cmd+=" export STOCHASTIC_ROUNDING='$stochastic_rounding';"
-    cmd+=" export TARGET_NFE='$target_nfe';"
-    cmd+=" export NFE_TARGET_LOWER='$nfe_lower';"
-    cmd+=" export NFE_TARGET_UPPER='$nfe_upper';"
-    cmd+=" export TARGET_ENV_TIMESTEPS='$target_env_steps';"
-    cmd+=" export RANGE_OPEN_RATE='${RANGE_OPEN_RATE_OVERRIDE:-0.06}';"
-    cmd+=" export RANGE_CLOSE_RATE='0.0';"
-    cmd+=" export DIFFICULTY_SUCCESS_OPEN_RATE='${DIFFICULTY_SUCCESS_OPEN_RATE_OVERRIDE:-0.06}';"
-    cmd+=" export DIFFICULTY_SUCCESS_CLOSE_RATE='0.0';"
-    cmd+=" export OMP_NUM_THREADS='${OMP_NUM_THREADS:-1}';"
-    cmd+=" export MKL_NUM_THREADS='${MKL_NUM_THREADS:-1}';"
-    cmd+=" export OPENBLAS_NUM_THREADS='${OPENBLAS_NUM_THREADS:-1}';"
-    cmd+=" export NUMEXPR_NUM_THREADS='${NUMEXPR_NUM_THREADS:-1}';"
-    append_export_if_set WANDB_API_KEY
-    append_export_if_set WANDB_ENTITY
-    append_export_if_set WANDB_BASE_URL
-    append_export_if_set WANDB_DIR
-    append_export_if_set WANDB_CACHE_DIR
-    append_export_if_set WANDB_CONFIG_DIR
-    append_export_if_set N_EVAL_ENVS
-    append_export_if_set NUM_EVALS
-    append_export_if_set EVAL_VIDEO
-    cmd+=" echo '=== start job index=${i} arm=${arm} task=${task} seed=${seed} signal=${SIGNAL_VARIANT} gpu=${gpu} ===';"
-    cmd+=" echo 'arm config: steps=${easy_steps}->${hard_steps} chunk=${easy_chunk}->${hard_chunk} chunk_elastic=${chunk_elastic} stochastic=${stochastic_rounding} nfe=[${nfe_lower},${nfe_upper}] target=${target_nfe}';"
-    cmd+=" bash scripts/launch_step_difficulty_h20.sh '${task}' '${gpu}' '${seed}' '${label}' '${SIGNAL_VARIANT}' 2>&1 | tee '${log}';"
-    cmd+=" echo '=== finished job index=${i} arm=${arm} task=${task} seed=${seed} ===';"
-  fi
+  cmd="set -euo pipefail;"
+  cmd+=" cd '$PROJECT_ROOT';"
+  cmd+=" export RUN_TAG='$run_tag';"
+  cmd+=" export WANDB_GROUP_PREFIX='$group_prefix';"
+  cmd+=" export WANDB_MODE='${WANDB_MODE:-online}';"
+  cmd+=" export WANDB_PROJECT='${WANDB_PROJECT:-DSRL_robomimic}';"
+  cmd+=" export DIFFICULTY_EASY_STEPS_TARGET='$easy_steps';"
+  cmd+=" export DIFFICULTY_HARD_STEPS_TARGET='$hard_steps';"
+  cmd+=" export DIFFICULTY_EASY_CHUNK_TARGET='$easy_chunk';"
+  cmd+=" export DIFFICULTY_HARD_CHUNK_TARGET='$hard_chunk';"
+  cmd+=" export ENABLE_CHUNK_ELASTICITY='$chunk_elastic';"
+  cmd+=" export STOCHASTIC_ROUNDING='$stochastic_rounding';"
+  cmd+=" export TARGET_NFE='$target_nfe';"
+  cmd+=" export NFE_TARGET_LOWER='$nfe_lower';"
+  cmd+=" export NFE_TARGET_UPPER='$nfe_upper';"
+  cmd+=" export TARGET_ENV_TIMESTEPS='$target_env_steps';"
+  cmd+=" export RANGE_OPEN_RATE='${RANGE_OPEN_RATE_OVERRIDE:-0.06}';"
+  cmd+=" export RANGE_CLOSE_RATE='0.0';"
+  cmd+=" export DIFFICULTY_SUCCESS_OPEN_RATE='${DIFFICULTY_SUCCESS_OPEN_RATE_OVERRIDE:-0.06}';"
+  cmd+=" export DIFFICULTY_SUCCESS_CLOSE_RATE='0.0';"
+  cmd+=" export OMP_NUM_THREADS='${OMP_NUM_THREADS:-1}';"
+  cmd+=" export MKL_NUM_THREADS='${MKL_NUM_THREADS:-1}';"
+  cmd+=" export OPENBLAS_NUM_THREADS='${OPENBLAS_NUM_THREADS:-1}';"
+  cmd+=" export NUMEXPR_NUM_THREADS='${NUMEXPR_NUM_THREADS:-1}';"
+  append_export_if_set WANDB_API_KEY
+  append_export_if_set WANDB_ENTITY
+  append_export_if_set WANDB_BASE_URL
+  append_export_if_set WANDB_DIR
+  append_export_if_set WANDB_CACHE_DIR
+  append_export_if_set WANDB_CONFIG_DIR
+  append_export_if_set N_EVAL_ENVS
+  append_export_if_set NUM_EVALS
+  append_export_if_set EVAL_VIDEO
+  cmd+=" echo '=== start job index=${i} arm=${arm} task=${task} seed=${seed} signal=${SIGNAL_VARIANT} gpu=${gpu} ===';"
+  cmd+=" echo 'arm config: steps=${easy_steps}->${hard_steps} chunk=${easy_chunk}->${hard_chunk} chunk_elastic=${chunk_elastic} stochastic=${stochastic_rounding} nfe=[${nfe_lower},${nfe_upper}] target=${target_nfe}';"
+  cmd+=" bash scripts/launch_step_difficulty_h20.sh '${task}' '${gpu}' '${seed}' '${label}' '${SIGNAL_VARIANT}' 2>&1 | tee '${log}';"
+  cmd+=" echo '=== finished job index=${i} arm=${arm} task=${task} seed=${seed} ===';"
 
   tmux new-session -d -s "$session" "bash -lc $(printf '%q' "$cmd")"
   echo "started $session on gpu $gpu"
