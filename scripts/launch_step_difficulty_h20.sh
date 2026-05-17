@@ -119,6 +119,8 @@ DIFFICULTY_SIGNAL_MODE=compute_advantage
 DIFFICULTY_PRIOR_SIGNAL_SCALE=1.0
 DIFFICULTY_SIGNAL_SCALE=0.75
 DIFFICULTY_WEIGHT=0.04
+DIFFICULTY_ALLOCATION_SCALE=1.0
+DIFFICULTY_LOSS_MODE=elastic_margin_hinge
 DIFFICULTY_MODE_MARGIN_WEIGHT=0.20
 DIFFICULTY_QUANTILE_HINGE_WEIGHT=0.0
 if [[ "$TASK" == "can" ]]; then
@@ -210,7 +212,7 @@ echo "run=${RUN_NAME} gpu=${GPU} task=${TASK} seed=${SEED} variant=${VARIANT}"
 echo "target_env_timesteps=${TARGET_ENV_TIMESTEPS} eval_envs=${N_EVAL_ENVS} eval_rollouts=${NUM_EVALS}"
 echo "difficulty: prior_mode=${DIFFICULTY_PRIOR_SIGNAL_MODE}, loss_mode=${DIFFICULTY_SIGNAL_MODE}, prior_scale=${DIFFICULTY_PRIOR_SCALE}, prior_signal_scale=${DIFFICULTY_PRIOR_SIGNAL_SCALE}, loss_signal_scale=${DIFFICULTY_SIGNAL_SCALE}"
 echo "step/chunk: range=${MIN_DENOISING_STEPS}..${MAX_DENOISING_STEPS}, easy_steps=${DIFFICULTY_EASY_STEPS_TARGET}, hard_steps=${DIFFICULTY_HARD_STEPS_TARGET}, easy_chunk=${DIFFICULTY_EASY_CHUNK_TARGET}, hard_chunk=${DIFFICULTY_HARD_CHUNK_TARGET}, preprior=${PREPRIOR_RESIDUAL_SCALE}, residual=${SCHEDULE_RESIDUAL_SCALE}"
-echo "loss: weight=${DIFFICULTY_WEIGHT}, mode_margin=${DIFFICULTY_MODE_MARGIN_WEIGHT}, quantile=${DIFFICULTY_QUANTILE_HINGE_WEIGHT}"
+echo "loss: mode=${DIFFICULTY_LOSS_MODE}, weight=${DIFFICULTY_WEIGHT}, allocation_scale=${DIFFICULTY_ALLOCATION_SCALE}, mode_margin=${DIFFICULTY_MODE_MARGIN_WEIGHT}, quantile=${DIFFICULTY_QUANTILE_HINGE_WEIGHT}"
 echo "cost: band=[${NFE_TARGET_LOWER},${NFE_TARGET_UPPER}], target=${TARGET_NFE}, lambda=${ACTOR_COMPUTE_LAMBDA_WARMUP}->${ACTOR_COMPUTE_LAMBDA}"
 
 python train_dsrl.py --config-name "dsrl_${TASK}.yaml" \
@@ -279,7 +281,8 @@ python train_dsrl.py --config-name "dsrl_${TASK}.yaml" \
   ++train.difficulty_prior_signal_scale="$DIFFICULTY_PRIOR_SIGNAL_SCALE" \
   ++train.difficulty_prior_gate_floor="$DIFFICULTY_PRIOR_GATE_FLOOR" \
   ++train.difficulty_weight="$DIFFICULTY_WEIGHT" \
-  ++train.difficulty_loss_mode=elastic_margin_hinge \
+  ++train.difficulty_allocation_scale="$DIFFICULTY_ALLOCATION_SCALE" \
+  ++train.difficulty_loss_mode="$DIFFICULTY_LOSS_MODE" \
   ++train.difficulty_signal_mode="$DIFFICULTY_SIGNAL_MODE" \
   ++train.difficulty_signal_scale="$DIFFICULTY_SIGNAL_SCALE" \
   ++train.difficulty_start_step="$DIFFICULTY_START_STEP" \

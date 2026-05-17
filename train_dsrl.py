@@ -237,6 +237,7 @@ def main(cfg: OmegaConf):
 			difficulty_prior_signal_scale=cfg.train.get("difficulty_prior_signal_scale", 2.0),
 			difficulty_prior_gate_floor=cfg.train.get("difficulty_prior_gate_floor", 0.3),
 			difficulty_weight=cfg.train.get("difficulty_weight", 0.3),
+			difficulty_allocation_scale=cfg.train.get("difficulty_allocation_scale", 1.0),
 			difficulty_loss_mode=cfg.train.get("difficulty_loss_mode", "elastic_margin_hinge"),
 			difficulty_signal_mode=cfg.train.get("difficulty_signal_mode", "compute_advantage"),
 			difficulty_signal_scale=cfg.train.get("difficulty_signal_scale", 1.0),

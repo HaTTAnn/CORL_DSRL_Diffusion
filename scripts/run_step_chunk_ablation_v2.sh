@@ -4,7 +4,7 @@ set -euo pipefail
 # Step/chunk ablation for natural step elasticity:
 #   weak_chunk:    steps 3..8, chunk elastic but weak (4 -> 3.75)
 #   both_explore:  steps 3..8, chunk fully elastic (4 -> 3)
-#   step_only:     steps 3..8, chunk fixed at 4
+#   step_only:     steps 3..15, chunk fixed at 4
 
 PLAN="${1:-12}"
 GPUS_CSV="${2:-${GPUS:-0,1,2,3,4,5,6,7}}"
