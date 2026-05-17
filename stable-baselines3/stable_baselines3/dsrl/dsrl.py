@@ -817,7 +817,15 @@ class DSRL(OffPolicyAlgorithm):
 		prior_chunk = default_chunk + prior_scale * (prior_chunk - default_chunk)
 		return th.clamp(prior_steps, 0.0, 1.0), th.clamp(prior_chunk, 0.0, 1.0), prior_gate
 
-	def _difficulty_alignment_loss(self, steps_ctrl: th.Tensor, chunk_ctrl: th.Tensor, difficulty: th.Tensor) -> tuple[th.Tensor, dict[str, float]]:
+
+	def _difficulty_alignment_loss(
+		self,
+		steps_ctrl: th.Tensor,
+		chunk_ctrl: th.Tensor,
+		difficulty: th.Tensor,
+		mode_steps_ctrl: Optional[th.Tensor] = None,
+		mode_chunk_ctrl: Optional[th.Tensor] = None,
+	) -> tuple[th.Tensor, dict[str, float]]:
 		zero = steps_ctrl.sum() * 0.0
 		gate_logs = self._gate_snapshot()
 		gate_logs["difficulty_loss_gate"] = 0.0
@@ -825,7 +833,13 @@ class DSRL(OffPolicyAlgorithm):
 		gate_logs["monotonic_inversion_rate"] = 0.0
 		if self.difficulty_weight <= 0.0 or self.difficulty_loss_mode in {"none", "off"}:
 			return zero, gate_logs
-		loss_gate = max(gate_logs["difficulty_combined_gate"], gate_logs["margin_floor_gate_after_range_success"])
+
+		mode = self.difficulty_loss_mode
+		margin_modes = {"elastic_margin", "margin", "difficulty_margin", "elastic_margin_hinge", "margin_hinge", "elastic_margin_quantile"}
+		if mode in margin_modes:
+			loss_gate = max(gate_logs["difficulty_combined_gate"], gate_logs["margin_floor_gate_after_range_success"])
+		else:
+			loss_gate = gate_logs["difficulty_combined_gate"]
 		gate_logs["difficulty_loss_gate"] = float(loss_gate)
 		gate_logs["difficulty_margin_gate"] = float(gate_logs["margin_floor_gate_after_range_success"])
 		if loss_gate <= 0.0:
@@ -837,17 +851,52 @@ class DSRL(OffPolicyAlgorithm):
 		u = th.clamp(difficulty.detach().to(device=device, dtype=dtype), -1.0, 1.0)
 		confidence = th.clamp(u.abs(), 0.0, 1.0).detach()
 		allocation = steps_ctrl - chunk_ctrl
-		mode = self.difficulty_loss_mode
+		has_mode_controls = mode_steps_ctrl is not None and mode_chunk_ctrl is not None
+		if has_mode_controls:
+			mode_steps_ctrl = mode_steps_ctrl.to(device=device, dtype=dtype)
+			mode_chunk_ctrl = mode_chunk_ctrl.to(device=device, dtype=dtype)
+			mode_allocation = mode_steps_ctrl - mode_chunk_ctrl
+		else:
+			mode_allocation = None
 		allocation_scale = th.as_tensor(self.difficulty_allocation_scale, device=device, dtype=dtype)
+		margin_target = th.as_tensor(self.difficulty_margin_target, device=device, dtype=dtype)
+		mode_margin_weight = th.as_tensor(max(self.difficulty_mode_margin_weight, 0.0), device=device, dtype=dtype)
+		quantile_hinge_weight = th.as_tensor(max(self.difficulty_quantile_hinge_weight, 0.0), device=device, dtype=dtype)
 
-		def weighted_mean(values: th.Tensor, weights: th.Tensor) -> th.Tensor:
-			weights = weights.to(device=values.device, dtype=values.dtype)
-			return (values * weights).sum() / weights.sum().clamp_min(1.0)
+		def confidence_mean(values: th.Tensor) -> th.Tensor:
+			return (confidence * values).mean()
+
+		def indexed_mean(values: th.Tensor, indices: th.Tensor) -> th.Tensor:
+			if indices.numel() == 0:
+				return zero
+			return values[indices].mean()
 
 		easy_steps = self._control_from_value(self.difficulty_easy_steps_target, self.min_denoising_steps, self.max_denoising_steps, batch, device=device, dtype=dtype)
 		hard_steps = self._control_from_value(self.difficulty_hard_steps_target, self.min_denoising_steps, self.max_denoising_steps, batch, device=device, dtype=dtype)
 		easy_chunk = self._control_from_value(self.difficulty_easy_chunk_target, self.min_chunk_size, self.max_chunk_size, batch, device=device, dtype=dtype)
 		hard_chunk = self._control_from_value(self.difficulty_hard_chunk_target, self.min_chunk_size, self.max_chunk_size, batch, device=device, dtype=dtype)
+
+		def quantile_hinge_loss_for(step_values: th.Tensor, chunk_values: th.Tensor) -> th.Tensor:
+			if batch < 4:
+				return zero
+			u_flat = u.reshape(-1)
+			_, order = th.sort(u_flat)
+			k = max(1, int(np.ceil(0.30 * batch)))
+			easy_idx = order[:k]
+			hard_idx = order[-k:]
+			step_flat = step_values.reshape(-1)
+			chunk_flat = chunk_values.reshape(-1)
+			easy_steps_flat = easy_steps.reshape(-1)
+			hard_steps_flat = hard_steps.reshape(-1)
+			easy_chunk_flat = easy_chunk.reshape(-1)
+			hard_chunk_flat = hard_chunk.reshape(-1)
+			return (
+				indexed_mean(F.relu(hard_steps_flat - step_flat).pow(2), hard_idx)
+				+ indexed_mean(F.relu(chunk_flat - hard_chunk_flat).pow(2), hard_idx)
+				+ indexed_mean(F.relu(step_flat - easy_steps_flat).pow(2), easy_idx)
+				+ indexed_mean(F.relu(easy_chunk_flat - chunk_flat).pow(2), easy_idx)
+			)
+
 		if mode in {"target_mse", "mse"}:
 			mix = 0.5 * (u + 1.0)
 			steps_target = easy_steps + mix * (hard_steps - easy_steps)
@@ -855,11 +904,22 @@ class DSRL(OffPolicyAlgorithm):
 			loss = F.mse_loss(steps_ctrl, steps_target.detach()) + F.mse_loss(chunk_ctrl, chunk_target.detach())
 		elif mode in {"bidir_allocation", "bidir", "allocation"}:
 			allocation_target = th.clamp(allocation_scale * u, -1.0, 1.0).detach()
-			loss = weighted_mean((allocation - allocation_target).pow(2).reshape(-1), confidence.reshape(-1))
-		elif mode in {"elastic_margin", "margin", "difficulty_margin", "elastic_margin_hinge", "margin_hinge", "elastic_margin_quantile"}:
-			effective_margin = allocation_scale * th.as_tensor(self.difficulty_margin_target, device=device, dtype=dtype)
-			margin_error = F.relu(effective_margin - u * allocation)
-			loss = weighted_mean(margin_error.pow(2).reshape(-1), confidence.reshape(-1))
+			loss = confidence_mean((allocation - allocation_target).pow(2))
+		elif mode in margin_modes:
+			effective_margin = allocation_scale * margin_target
+			sample_margin_error = F.relu(effective_margin - u * allocation)
+			sample_margin_loss = confidence_mean(sample_margin_error.pow(2))
+			if mode_allocation is not None:
+				mode_margin_error = F.relu(effective_margin - u * mode_allocation)
+				mode_margin_loss = confidence_mean(mode_margin_error.pow(2))
+			else:
+				mode_margin_loss = zero
+			quantile_loss = quantile_hinge_loss_for(steps_ctrl, chunk_ctrl)
+			if has_mode_controls:
+				mode_quantile_loss = quantile_hinge_loss_for(mode_steps_ctrl, mode_chunk_ctrl)
+			else:
+				mode_quantile_loss = zero
+			loss = sample_margin_loss + mode_margin_weight * mode_margin_loss + quantile_hinge_weight * (quantile_loss + mode_margin_weight * mode_quantile_loss)
 		elif mode in {"target_hinge", "hard_easy_hinge"}:
 			loss = zero
 			terms = 0
@@ -877,23 +937,14 @@ class DSRL(OffPolicyAlgorithm):
 			if terms > 0:
 				loss = loss / float(terms)
 		elif mode in {"quantile_hinge", "hinge", "difficulty_hinge"}:
-			loss = zero
+			quantile_loss = quantile_hinge_loss_for(steps_ctrl, chunk_ctrl)
+			if has_mode_controls:
+				mode_quantile_loss = quantile_hinge_loss_for(mode_steps_ctrl, mode_chunk_ctrl)
+			else:
+				mode_quantile_loss = zero
+			loss = quantile_loss + mode_margin_weight * mode_quantile_loss
 		else:
 			raise ValueError(f"Unknown difficulty_loss_mode={self.difficulty_loss_mode!r}")
-
-		if self.difficulty_quantile_hinge_weight > 0.0 and batch >= 4:
-			u_flat = u.reshape(-1)
-			_, order = th.sort(u_flat)
-			k = max(1, batch // 4)
-			easy_idx = order[:k]
-			hard_idx = order[-k:]
-			step_gap = steps_ctrl[hard_idx].mean() - steps_ctrl[easy_idx].mean()
-			chunk_gap = chunk_ctrl[easy_idx].mean() - chunk_ctrl[hard_idx].mean()
-			step_target_gap = abs(self._control_value(self.difficulty_hard_steps_target, self.min_denoising_steps, self.max_denoising_steps) - self._control_value(self.difficulty_easy_steps_target, self.min_denoising_steps, self.max_denoising_steps))
-			chunk_target_gap = abs(self._control_value(self.difficulty_easy_chunk_target, self.min_chunk_size, self.max_chunk_size) - self._control_value(self.difficulty_hard_chunk_target, self.min_chunk_size, self.max_chunk_size))
-			quantile_loss = F.relu(th.as_tensor(step_target_gap, device=device, dtype=dtype) - step_gap).pow(2)
-			quantile_loss = quantile_loss + F.relu(th.as_tensor(chunk_target_gap, device=device, dtype=dtype) - chunk_gap).pow(2)
-			loss = loss + self.difficulty_quantile_hinge_weight * quantile_loss
 
 		if batch >= 2:
 			with th.no_grad():
@@ -903,7 +954,7 @@ class DSRL(OffPolicyAlgorithm):
 				inverted = allocation_flat[:, None] < allocation_flat[None, :]
 				valid_pairs = harder.sum().clamp_min(1)
 				gate_logs["monotonic_inversion_rate"] = float((harder & inverted).sum().float().div(valid_pairs.float()).item())
-		loss = self.difficulty_weight * loss_gate * self.difficulty_mode_margin_weight * loss
+		loss = self.difficulty_weight * loss_gate * loss
 		return loss, gate_logs
 
 	def _mode_id(self) -> float:
@@ -1046,6 +1097,8 @@ class DSRL(OffPolicyAlgorithm):
 		if self.schedule_control_mode == "prior_only":
 			policy_steps = prior_steps
 			policy_chunk = prior_chunk
+			mode_policy_steps = prior_steps
+			mode_policy_chunk = prior_chunk
 			log_prob_steps = default_log_prob
 			log_prob_chunk = default_log_prob
 		else:
@@ -1053,29 +1106,46 @@ class DSRL(OffPolicyAlgorithm):
 			assert self.chunk_mu is not None and self.chunk_log_std is not None
 			features = self.actor.extract_features(obs, self.actor.features_extractor)
 			latent = self.actor.latent_pi(features)
-			learned_steps, log_prob_steps = self._sample_sigmoid_head(self.steps_mu(latent), self.steps_log_std(latent), deterministic=deterministic)
-			learned_chunk, log_prob_chunk = self._sample_sigmoid_head(self.chunk_mu(latent), self.chunk_log_std(latent), deterministic=deterministic)
+			steps_mu = self.steps_mu(latent)
+			steps_log_std = self.steps_log_std(latent)
+			chunk_mu = self.chunk_mu(latent)
+			chunk_log_std = self.chunk_log_std(latent)
+			learned_steps, log_prob_steps = self._sample_sigmoid_head(steps_mu, steps_log_std, deterministic=deterministic)
+			learned_chunk, log_prob_chunk = self._sample_sigmoid_head(chunk_mu, chunk_log_std, deterministic=deterministic)
+			mode_learned_steps, _ = self._sample_sigmoid_head(steps_mu, steps_log_std, deterministic=True)
+			mode_learned_chunk, _ = self._sample_sigmoid_head(chunk_mu, chunk_log_std, deterministic=True)
 			if self.schedule_control_mode == "learned":
 				policy_steps = learned_steps
 				policy_chunk = learned_chunk
+				mode_policy_steps = mode_learned_steps
+				mode_policy_chunk = mode_learned_chunk
 			else:
 				residual_center = th.full_like(learned_steps, 0.5)
 				policy_steps = prior_steps + active_residual_scale * (learned_steps - residual_center)
 				policy_chunk = prior_chunk + active_residual_scale * (learned_chunk - residual_center)
+				mode_policy_steps = prior_steps + active_residual_scale * (mode_learned_steps - residual_center)
+				mode_policy_chunk = prior_chunk + active_residual_scale * (mode_learned_chunk - residual_center)
 
 		gate_snapshot = self._gate_snapshot()
 		steps_ctrl = default_steps + schedule_gate * (policy_steps - default_steps)
 		chunk_ctrl = default_chunk + schedule_gate * (policy_chunk - default_chunk)
+		mode_steps_ctrl = default_steps + schedule_gate * (mode_policy_steps - default_steps)
+		mode_chunk_ctrl = default_chunk + schedule_gate * (mode_policy_chunk - default_chunk)
 		steps_ctrl = th.clamp(steps_ctrl, 0.0, 1.0)
 		chunk_ctrl = th.clamp(chunk_ctrl, 0.0, 1.0)
+		mode_steps_ctrl = th.clamp(mode_steps_ctrl, 0.0, 1.0)
+		mode_chunk_ctrl = th.clamp(mode_chunk_ctrl, 0.0, 1.0)
 		if not self.enable_chunk_elasticity:
 			chunk_ctrl = default_chunk
+			mode_chunk_ctrl = default_chunk
 			log_prob_chunk = default_log_prob
 		self._last_schedule_info = {
 			"difficulty": difficulty.detach(),
 			"difficulty_prior_u": prior_u.detach(),
 			"difficulty_source_score": difficulty_source_score.detach(),
 			"difficulty_prior_source_score": difficulty_prior_source_score.detach(),
+			"mode_steps_ctrl": mode_steps_ctrl,
+			"mode_chunk_ctrl": mode_chunk_ctrl,
 			"schedule_gate": float(schedule_gate),
 			"schedule_step_gate": float(schedule_step_gate),
 			"schedule_residual_authority": float(prior_authority),
@@ -1491,7 +1561,16 @@ class DSRL(OffPolicyAlgorithm):
 					difficulty = schedule_info.get("difficulty")
 					if difficulty is not None:
 						difficulty = difficulty.detach().to(device=steps_actor.device, dtype=steps_actor.dtype)
-						diff_loss, _ = self._difficulty_alignment_loss(steps_actor, chunk_actor, difficulty)
+
+						mode_steps_actor = schedule_info.get("mode_steps_ctrl")
+						mode_chunk_actor = schedule_info.get("mode_chunk_ctrl")
+						if mode_steps_actor is not None and mode_chunk_actor is not None:
+							mode_steps_actor = mode_steps_actor.to(device=steps_actor.device, dtype=steps_actor.dtype)
+							mode_chunk_actor = mode_chunk_actor.to(device=steps_actor.device, dtype=steps_actor.dtype)
+						else:
+							mode_steps_actor = None
+							mode_chunk_actor = None
+						diff_loss, _ = self._difficulty_alignment_loss(steps_actor, chunk_actor, difficulty, mode_steps_actor, mode_chunk_actor)
 						if diff_loss.requires_grad or diff_loss.item() != 0.0:
 							actor_loss = actor_loss + diff_loss
 						difficulty_losses.append(float(diff_loss.detach().item()))
