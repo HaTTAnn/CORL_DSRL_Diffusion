@@ -850,14 +850,10 @@ class DSRL(OffPolicyAlgorithm):
 		device = steps_ctrl.device
 		u = th.clamp(difficulty.detach().to(device=device, dtype=dtype), -1.0, 1.0)
 		confidence = th.clamp(u.abs(), 0.0, 1.0).detach()
-		allocation = steps_ctrl - chunk_ctrl
 		has_mode_controls = mode_steps_ctrl is not None and mode_chunk_ctrl is not None
 		if has_mode_controls:
 			mode_steps_ctrl = mode_steps_ctrl.to(device=device, dtype=dtype)
 			mode_chunk_ctrl = mode_chunk_ctrl.to(device=device, dtype=dtype)
-			mode_allocation = mode_steps_ctrl - mode_chunk_ctrl
-		else:
-			mode_allocation = None
 		allocation_scale = th.as_tensor(self.difficulty_allocation_scale, device=device, dtype=dtype)
 		margin_target = th.as_tensor(self.difficulty_margin_target, device=device, dtype=dtype)
 		mode_margin_weight = th.as_tensor(max(self.difficulty_mode_margin_weight, 0.0), device=device, dtype=dtype)
@@ -875,6 +871,23 @@ class DSRL(OffPolicyAlgorithm):
 		hard_steps = self._control_from_value(self.difficulty_hard_steps_target, self.min_denoising_steps, self.max_denoising_steps, batch, device=device, dtype=dtype)
 		easy_chunk = self._control_from_value(self.difficulty_easy_chunk_target, self.min_chunk_size, self.max_chunk_size, batch, device=device, dtype=dtype)
 		hard_chunk = self._control_from_value(self.difficulty_hard_chunk_target, self.min_chunk_size, self.max_chunk_size, batch, device=device, dtype=dtype)
+
+		def directional_allocation(step_values: th.Tensor, chunk_values: th.Tensor) -> th.Tensor:
+			terms: list[th.Tensor] = []
+			step_delta = hard_steps - easy_steps
+			if step_delta.detach().abs().max().item() > 1e-6:
+				step_score = 2.0 * (step_values - easy_steps) / step_delta - 1.0
+				terms.append(th.clamp(step_score, -1.0, 1.0))
+			chunk_delta = hard_chunk - easy_chunk
+			if self.enable_chunk_elasticity and chunk_delta.detach().abs().max().item() > 1e-6:
+				chunk_score = 2.0 * (chunk_values - easy_chunk) / chunk_delta - 1.0
+				terms.append(th.clamp(chunk_score, -1.0, 1.0))
+			if len(terms) == 0:
+				return th.zeros_like(step_values)
+			return th.stack(terms, dim=0).mean(dim=0)
+
+		allocation = directional_allocation(steps_ctrl, chunk_ctrl)
+		mode_allocation = directional_allocation(mode_steps_ctrl, mode_chunk_ctrl) if has_mode_controls else None
 
 		def quantile_hinge_loss_for(step_values: th.Tensor, chunk_values: th.Tensor) -> th.Tensor:
 			if batch < 4:
