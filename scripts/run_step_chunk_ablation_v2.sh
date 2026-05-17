@@ -2,8 +2,8 @@
 set -euo pipefail
 
 # Step/chunk ablation for natural step elasticity:
-#   weak_chunk:    steps 3..8, chunk elastic but weak (4 -> 3.75)
-#   both_explore:  steps 3..8, chunk fully elastic (4 -> 3)
+#   weak_chunk:    steps 3..15, chunk elastic but weak (4 -> 3.75)
+#   both_explore:  steps 3..15, chunk fully elastic (4 -> 3)
 #   step_only:     steps 3..15, chunk fixed at 4
 
 PLAN="${1:-12}"
@@ -131,9 +131,9 @@ for i in "${!JOBS[@]}"; do
   case "$arm" in
     weak_chunk)
       min_steps=3
-      max_steps=8
+      max_steps=15
       easy_steps=3
-      hard_steps=8
+      hard_steps=15
       easy_chunk=4
       hard_chunk=3.75
       chunk_elastic=true
@@ -143,9 +143,9 @@ for i in "${!JOBS[@]}"; do
       ;;
     both_explore)
       min_steps=3
-      max_steps=8
+      max_steps=15
       easy_steps=3
-      hard_steps=8
+      hard_steps=15
       easy_chunk=4
       hard_chunk=3
       chunk_elastic=true
