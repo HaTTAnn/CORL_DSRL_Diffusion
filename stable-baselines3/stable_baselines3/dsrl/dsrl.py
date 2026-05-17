@@ -140,7 +140,7 @@ class DSRL(OffPolicyAlgorithm):
 		cost_warmup_steps: float = 1.0,
 		cost_success_thresh_1: Optional[float] = None,
 		cost_success_thresh_2: Optional[float] = None,
-		cost_open_rate: float = 0.05,
+		cost_open_rate: float = 0.08,
 		cost_close_rate: float = 1.0,
 		cost_no_rollback: bool = False,
 		budget_penalty_location: str = "rollout_reward",
@@ -152,6 +152,7 @@ class DSRL(OffPolicyAlgorithm):
 		nfe_under_weight: float = 0.3,
 		nfe_saving_weight: float = 0.0,
 		episode_success_threshold: float = -0.5,
+		failed_episode_cost_weight: float = 1.0,
 		enable_chunk_elasticity: bool = False,
 		range_alpha_mode: str = "step_success",
 		range_actuator_floor: float = 0.0,
@@ -268,7 +269,7 @@ class DSRL(OffPolicyAlgorithm):
 		lambda_warmup = self.actor_compute_lambda if actor_compute_lambda_warmup is None else float(max(0.0, actor_compute_lambda_warmup))
 		self.actor_compute_lambda_warmup = float(min(lambda_warmup, self.actor_compute_lambda))
 		self.cost_gate_mode = str(cost_gate_mode).lower()
-		valid_cost_gate_modes = {"fixed", "success", "open_only_success", "success_mix", "step_monotonic"}
+		valid_cost_gate_modes = {"fixed", "success", "open_only_success", "success_mix", "step_monotonic", "step_success"}
 		if self.cost_gate_mode not in valid_cost_gate_modes:
 			raise ValueError(f"Unknown cost_gate_mode={cost_gate_mode!r}; expected one of {sorted(valid_cost_gate_modes)}")
 		self.cost_start_step = float(max(0.0, cost_start_step))
@@ -295,6 +296,7 @@ class DSRL(OffPolicyAlgorithm):
 		self.nfe_under_weight = float(max(0.0, nfe_under_weight))
 		self.nfe_saving_weight = float(max(0.0, nfe_saving_weight))
 		self.episode_success_threshold = float(episode_success_threshold)
+		self.failed_episode_cost_weight = float(np.clip(failed_episode_cost_weight, 0.0, 1.0))
 		self.enable_chunk_elasticity = bool(enable_chunk_elasticity)
 		self.range_alpha_mode = str(range_alpha_mode).lower()
 		self.range_actuator_floor = float(np.clip(range_actuator_floor, 0.0, 1.0))
@@ -512,6 +514,7 @@ class DSRL(OffPolicyAlgorithm):
 			"open_only_success": 2.0,
 			"success_mix": 2.0,
 			"step_monotonic": 3.0,
+			"step_success": 4.0,
 		}.get(self.cost_gate_mode, -1.0)
 
 	def _schedule_entropy_dims(self) -> int:
@@ -519,11 +522,16 @@ class DSRL(OffPolicyAlgorithm):
 			return 0
 		return 1 + int(self.enable_chunk_elasticity)
 
+	def _cost_step_progress(self) -> float:
+		progress = (self._gate_timesteps() - self.cost_start_step) / max(1.0, self.cost_warmup_steps)
+		return float(np.clip(progress, 0.0, 1.0))
+
 	def _cost_progress(self) -> float:
 		mode = self.cost_gate_mode
 		if mode == "step_monotonic":
-			progress = (self._gate_timesteps() - self.cost_start_step) / max(1.0, self.cost_warmup_steps)
-			return float(np.clip(progress, 0.0, 1.0))
+			return self._cost_step_progress()
+		if mode == "step_success":
+			return float(self._cost_step_progress() * np.clip(self._cost_success_mix, 0.0, 1.0))
 		if mode in {"open_only_success", "success_mix"}:
 			return float(np.clip(self._cost_success_mix, 0.0, 1.0))
 		if mode == "success":
@@ -655,6 +663,7 @@ class DSRL(OffPolicyAlgorithm):
 			"cost_progress": float(self._cost_progress()),
 			"cost_success_gate_raw": float(self._cost_success_gate_raw),
 			"cost_success_mix": float(self._cost_success_mix),
+			"cost_step_progress": float(self._cost_step_progress()),
 			"actor_compute_lambda_warmup": float(self.actor_compute_lambda_warmup),
 			"actor_compute_lambda_target": float(self.actor_compute_lambda),
 			"actor_compute_lambda_active": float(active_lambda),
@@ -1858,8 +1867,9 @@ class DSRL(OffPolicyAlgorithm):
 		ratio = steps / chunks
 		over = max(0.0, steps - self.nfe_target_upper * chunks - self.nfe_debt_limit)
 		under = max(0.0, self.nfe_target_lower * chunks - steps)
+		over_penalty = over if success else self.failed_episode_cost_weight * over
 		under_penalty = self.nfe_under_weight * under if success else 0.0
-		gross_penalty = (over + under_penalty) / self.nfe_budget_penalty_scale
+		gross_penalty = (over_penalty + under_penalty) / self.nfe_budget_penalty_scale
 		inside_band = self.nfe_target_lower <= ratio <= self.nfe_target_upper
 		if success and inside_band and self.nfe_target_upper > self.nfe_target_lower:
 			saving_norm = (self.nfe_target_upper - ratio) / max(1e-6, self.nfe_target_upper - self.nfe_target_lower)

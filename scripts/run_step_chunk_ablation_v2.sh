@@ -18,6 +18,24 @@ DRY_RUN="${DRY_RUN:-0}"
 WANDB_GROUP_PREFIX_BASE="${WANDB_GROUP_PREFIX:-stepchunk_ablation_v2_p${PLAN}}"
 LOG_DIR="${LOG_DIR:-$PROJECT_ROOT/run_logs}"
 
+# Final success-first budget defaults. Difficulty/range opens first; cost only
+# becomes strong after stable success, then compresses NFE toward a 15% saving.
+FINAL_ACTOR_COMPUTE_LAMBDA="${ACTOR_COMPUTE_LAMBDA:-0.45}"
+FINAL_ACTOR_COMPUTE_LAMBDA_WARMUP="${ACTOR_COMPUTE_LAMBDA_WARMUP:-0.05}"
+FINAL_NFE_UNDER_WEIGHT="${NFE_UNDER_WEIGHT:-0.15}"
+FINAL_NFE_DEBT_LIMIT="${NFE_DEBT_LIMIT:-4.0}"
+FINAL_NFE_BUDGET_PENALTY_SCALE="${NFE_BUDGET_PENALTY_SCALE:-10.0}"
+FINAL_NFE_SAVING_WEIGHT="${NFE_SAVING_WEIGHT:-0.06}"
+FINAL_FAILED_EPISODE_COST_WEIGHT="${FAILED_EPISODE_COST_WEIGHT:-0.15}"
+FINAL_COST_GATE_MODE="${COST_GATE_MODE:-step_success}"
+FINAL_COST_START_STEP="${COST_START_STEP:-10000}"
+FINAL_COST_WARMUP_STEPS="${COST_WARMUP_STEPS:-90000}"
+FINAL_COST_SUCCESS_THRESH_1="${COST_SUCCESS_THRESH_1:-0.65}"
+FINAL_COST_SUCCESS_THRESH_2="${COST_SUCCESS_THRESH_2:-0.80}"
+FINAL_COST_OPEN_RATE="${COST_OPEN_RATE:-0.08}"
+FINAL_COST_CLOSE_RATE="${COST_CLOSE_RATE:-0.10}"
+FINAL_COST_NO_ROLLBACK="${COST_NO_ROLLBACK:-0}"
+
 append_export_if_set() {
   local name="$1"
   local value="${!name:-}"
@@ -84,6 +102,7 @@ echo "wandb group prefix base: $WANDB_GROUP_PREFIX_BASE"
 echo "arms: ${ARMS[*]}"
 echo "tasks: ${TASKS[*]}"
 echo "seeds: ${SEEDS[*]}"
+echo "budget defaults: cost=${FINAL_COST_GATE_MODE} start=${FINAL_COST_START_STEP} warmup=${FINAL_COST_WARMUP_STEPS} success=${FINAL_COST_SUCCESS_THRESH_1}->${FINAL_COST_SUCCESS_THRESH_2} open=${FINAL_COST_OPEN_RATE} close=${FINAL_COST_CLOSE_RATE} lambda=${FINAL_ACTOR_COMPUTE_LAMBDA_WARMUP}->${FINAL_ACTOR_COMPUTE_LAMBDA} saving=${FINAL_NFE_SAVING_WEIGHT} failed=${FINAL_FAILED_EPISODE_COST_WEIGHT}"
 echo
 
 GPU_COUNTS=()
@@ -138,8 +157,6 @@ for i in "${!JOBS[@]}"; do
       hard_chunk=3.75
       chunk_elastic=true
       stochastic_rounding=true
-      nfe_upper_can=1.95
-      nfe_upper_square=1.95
       ;;
     both_explore)
       min_steps=3
@@ -150,8 +167,6 @@ for i in "${!JOBS[@]}"; do
       hard_chunk=3
       chunk_elastic=true
       stochastic_rounding=true
-      nfe_upper_can=1.95
-      nfe_upper_square=1.95
       ;;
     step_only)
       min_steps=3
@@ -162,8 +177,6 @@ for i in "${!JOBS[@]}"; do
       hard_chunk=4
       chunk_elastic=false
       stochastic_rounding=true
-      nfe_upper_can=1.95
-      nfe_upper_square=1.95
       ;;
     *)
       echo "unknown arm: $arm" >&2
@@ -172,14 +185,14 @@ for i in "${!JOBS[@]}"; do
   esac
 
   if [[ "$task" == "can" ]]; then
-    target_nfe="${TARGET_NFE_CAN:-1.75}"
-    nfe_lower="${NFE_TARGET_LOWER_CAN:-1.45}"
-    nfe_upper="${NFE_TARGET_UPPER_CAN:-$nfe_upper_can}"
+    target_nfe="${TARGET_NFE_CAN:-1.70}"
+    nfe_lower="${NFE_TARGET_LOWER_CAN:-1.55}"
+    nfe_upper="${NFE_TARGET_UPPER_CAN:-1.90}"
     target_env_steps="${TARGET_ENV_TIMESTEPS_CAN:-1000000}"
   else
-    target_nfe="${TARGET_NFE_SQUARE:-1.90}"
-    nfe_lower="${NFE_TARGET_LOWER_SQUARE:-1.65}"
-    nfe_upper="${NFE_TARGET_UPPER_SQUARE:-$nfe_upper_square}"
+    target_nfe="${TARGET_NFE_SQUARE:-1.70}"
+    nfe_lower="${NFE_TARGET_LOWER_SQUARE:-1.55}"
+    nfe_upper="${NFE_TARGET_UPPER_SQUARE:-1.90}"
     target_env_steps="${TARGET_ENV_TIMESTEPS_SQUARE:-2000000}"
   fi
 
@@ -205,9 +218,28 @@ for i in "${!JOBS[@]}"; do
   cmd+=" export NFE_TARGET_LOWER='$nfe_lower';"
   cmd+=" export NFE_TARGET_UPPER='$nfe_upper';"
   cmd+=" export TARGET_ENV_TIMESTEPS='$target_env_steps';"
-  cmd+=" export RANGE_OPEN_RATE='${RANGE_OPEN_RATE_OVERRIDE:-0.06}';"
+  cmd+=" export ACTOR_COMPUTE_LAMBDA='$FINAL_ACTOR_COMPUTE_LAMBDA';"
+  cmd+=" export ACTOR_COMPUTE_LAMBDA_WARMUP='$FINAL_ACTOR_COMPUTE_LAMBDA_WARMUP';"
+  cmd+=" export NFE_UNDER_WEIGHT='$FINAL_NFE_UNDER_WEIGHT';"
+  cmd+=" export NFE_DEBT_LIMIT='$FINAL_NFE_DEBT_LIMIT';"
+  cmd+=" export NFE_BUDGET_PENALTY_SCALE='$FINAL_NFE_BUDGET_PENALTY_SCALE';"
+  cmd+=" export NFE_SAVING_WEIGHT='$FINAL_NFE_SAVING_WEIGHT';"
+  cmd+=" export FAILED_EPISODE_COST_WEIGHT='$FINAL_FAILED_EPISODE_COST_WEIGHT';"
+  cmd+=" export COST_GATE_MODE='$FINAL_COST_GATE_MODE';"
+  cmd+=" export COST_START_STEP='$FINAL_COST_START_STEP';"
+  cmd+=" export COST_WARMUP_STEPS='$FINAL_COST_WARMUP_STEPS';"
+  cmd+=" export COST_SUCCESS_THRESH_1='$FINAL_COST_SUCCESS_THRESH_1';"
+  cmd+=" export COST_SUCCESS_THRESH_2='$FINAL_COST_SUCCESS_THRESH_2';"
+  cmd+=" export COST_OPEN_RATE='$FINAL_COST_OPEN_RATE';"
+  cmd+=" export COST_CLOSE_RATE='$FINAL_COST_CLOSE_RATE';"
+  cmd+=" export COST_NO_ROLLBACK='$FINAL_COST_NO_ROLLBACK';"
+  if [[ -n "${RANGE_OPEN_RATE_OVERRIDE:-}" ]]; then
+    cmd+=" export RANGE_OPEN_RATE='$RANGE_OPEN_RATE_OVERRIDE';"
+  fi
   cmd+=" export RANGE_CLOSE_RATE='0.0';"
-  cmd+=" export DIFFICULTY_SUCCESS_OPEN_RATE='${DIFFICULTY_SUCCESS_OPEN_RATE_OVERRIDE:-0.06}';"
+  if [[ -n "${DIFFICULTY_SUCCESS_OPEN_RATE_OVERRIDE:-}" ]]; then
+    cmd+=" export DIFFICULTY_SUCCESS_OPEN_RATE='$DIFFICULTY_SUCCESS_OPEN_RATE_OVERRIDE';"
+  fi
   cmd+=" export DIFFICULTY_SUCCESS_CLOSE_RATE='0.0';"
   cmd+=" export OMP_NUM_THREADS='${OMP_NUM_THREADS:-1}';"
   cmd+=" export MKL_NUM_THREADS='${MKL_NUM_THREADS:-1}';"
@@ -223,7 +255,7 @@ for i in "${!JOBS[@]}"; do
   append_export_if_set NUM_EVALS
   append_export_if_set EVAL_VIDEO
   cmd+=" echo '=== start job index=${i} arm=${arm} task=${task} seed=${seed} signal=${SIGNAL_VARIANT} gpu=${gpu} ===';"
-  cmd+=" echo 'arm config: range=${min_steps}..${max_steps} steps=${easy_steps}->${hard_steps} chunk=${easy_chunk}->${hard_chunk} chunk_elastic=${chunk_elastic} stochastic=${stochastic_rounding} nfe=[${nfe_lower},${nfe_upper}] target=${target_nfe}';"
+  cmd+=" echo 'arm config: range=${min_steps}..${max_steps} steps=${easy_steps}->${hard_steps} chunk=${easy_chunk}->${hard_chunk} chunk_elastic=${chunk_elastic} stochastic=${stochastic_rounding} nfe=[${nfe_lower},${nfe_upper}] target=${target_nfe} cost=${FINAL_COST_GATE_MODE}/${FINAL_COST_OPEN_RATE} lambda=${FINAL_ACTOR_COMPUTE_LAMBDA_WARMUP}->${FINAL_ACTOR_COMPUTE_LAMBDA}';"
   cmd+=" bash scripts/launch_step_difficulty_h20.sh '${task}' '${gpu}' '${seed}' '${label}' '${SIGNAL_VARIANT}' 2>&1 | tee '${log}';"
   cmd+=" echo '=== finished job index=${i} arm=${arm} task=${task} seed=${seed} ===';"
 

@@ -75,88 +75,57 @@ Optional offline replay data is also excluded. If `load_offline_data=True`, make
 
 ## How To Run
 
-Main launch script:
+Main step/chunk ablation launcher:
 
 ```bash
-bash scripts/launch_budget_strong_chunk_ablation.sh TASK MODE [GPU] [SEED] [CONDA_ENV] [VARIANT]
+bash scripts/run_step_chunk_ablation_v2.sh [PLAN] [GPU_CSV] [ENV_LABEL]
 ```
 
 Arguments:
 
 ```text
-TASK:       can | lift | square
-MODE:       fixed | elastic
-GPU:        CUDA device id, default 7
-SEED:       random seed, default 1
-CONDA_ENV:  conda env name, default dsrl
-VARIANT:    base | tight | stable_v1 | stable_v2
+PLAN:       12 | square6 | smoke, default 12
+GPU_CSV:    CUDA device ids, default 0,1,2,3,4,5,6,7
+ENV_LABEL:  runtime label, default uv
 ```
 
-Recommended elastic run:
+The current three comparison arms are:
 
-```bash
-bash scripts/launch_budget_strong_chunk_ablation.sh can elastic 0 0 dsrl stable_v2
-```
-
-Fixed baseline example:
-
-```bash
-bash scripts/launch_budget_strong_chunk_ablation.sh can fixed 0 0 dsrl stable_v2
-```
-
-The script writes W&B logs online by default. To disable W&B sync:
-
-```bash
-WANDB_MODE=offline bash scripts/launch_budget_strong_chunk_ablation.sh can elastic 0 0 dsrl stable_v2
-```
-
-## Elastic Soft-Prior Sweep
-
-Run from the repo root:
-
-```bash
-cd /root/storage/CODE/txy/dsrl_fv
+```text
+weak_chunk:    steps 3..15, chunk 4 -> 3.75
+both_explore:  steps 3..15, chunk 4 -> 3
+step_only:     steps 3..15, chunk fixed at 4
 ```
 
 Preview only:
 
 ```bash
-DRY_RUN=1 scripts/run_elastic_softprior_sweep.sh 8 6,7 dsrl
-DRY_RUN=1 scripts/run_elastic_softprior_sweep.sh 16 6,7 dsrl
+DRY_RUN=1 RUN_TAG=stepchunk_v2_3to15 SIGNAL_VARIANT=advz_strong bash scripts/run_step_chunk_ablation_v2.sh 12 0,1,2,3 uv
 ```
 
 Start training:
 
 ```bash
-RUN_TAG=softprior_v1 scripts/run_elastic_softprior_sweep.sh 8 6,7 dsrl
-RUN_TAG=softprior_v1 scripts/run_elastic_softprior_sweep.sh 16 6,7 dsrl
+RUN_TAG=stepchunk_v2_3to15 SIGNAL_VARIANT=advz_strong bash scripts/run_step_chunk_ablation_v2.sh 12 0,1,2,3 uv
 ```
 
-Plans:
+The launcher writes W&B logs online by default. To disable W&B sync:
+
+```bash
+WANDB_MODE=offline RUN_TAG=stepchunk_v2_3to15 SIGNAL_VARIANT=advz_strong bash scripts/run_step_chunk_ablation_v2.sh 12 0,1,2,3 uv
+```
+
+Single-run entrypoint used by the launcher:
+
+```bash
+bash scripts/launch_step_difficulty_h20.sh TASK GPU SEED [ENV_LABEL] [VARIANT]
+```
+
+Supported single-run tasks and variants:
 
 ```text
-8 runs:  can/square x seed0/1 x soft_h2_bal/soft_h3_safe
-16 runs: can/square x seed0/1 x soft_h2_bal/soft_h2_res/soft_h3_safe/soft_h2_edge
-```
-
-Monitor:
-
-```bash
-tmux ls | grep dsrl_diff_elastic
-tmux attach -t dsrl_diff_elastic_p8_g6_softprior_v1
-```
-
-Logs:
-
-```bash
-ls run_logs/*softprior_v1*
-tail -f run_logs/softprior_v1_can_elastic_soft_h2_bal_seed0_gpu6.log
-```
-
-Single run:
-
-```bash
-scripts/launch_elastic_softprior.sh can 6 0 dsrl soft_h2_bal
+TASK:     can | square
+VARIANT:  rank_current | advz_current | advz_strong | qstdz_strong
 ```
 
 ## Important Files
@@ -166,7 +135,9 @@ train_dsrl.py                                      main training entrypoint
 utils.py                                          evaluation, logging, video, W&B filtering
 env_utils.py                                      Robomimic/FV wrappers and chunk execution
 cfg/robomimic/dsrl_can.yaml                       default CAN config
-scripts/launch_budget_strong_chunk_ablation.sh    main launch script
+scripts/run_step_chunk_ablation_v2.sh             current 3-arm step/chunk ablation launcher
+scripts/launch_step_difficulty_h20.sh             current single-run launcher
+scripts/run_step_difficulty_h20_sweep.sh          optional sweep using the current single-run launcher
 stable-baselines3/stable_baselines3/dsrl/dsrl.py  modified DSRL algorithm
 dppo/model/diffusion/diffusion.py                 diffusion policy implementation
 ```
@@ -178,30 +149,39 @@ dppo/model/diffusion/diffusion.py                 diffusion policy implementatio
 - Episode-level NFE band reward.
 - Success-gated saving bonus.
 - Difficulty-prior + actor-residual schedule control.
+- Target-normalized allocation difficulty loss aligned with the pi0 mode-margin idea.
 - Monotonic cost / difficulty gate opening.
-- W&B logs for success, NFE, chunk, difficulty, value loss, Q values, and query-level allocation.
+- W&B logs for success, NFE, chunk, difficulty, value loss, Q values, query-level allocation, success rate vs step, and success rate vs env timesteps.
 
 ## Key Parameters
 
-The recommended `stable_v2` setting uses:
+The current recommended step/chunk ablation uses:
 
 ```text
-steps range:          3 to 8
-chunk range:          1 to 4
-NFE band:             1.55 to 2.05
-saving weight:        0.06
-cost lambda:          0.15 -> 0.45
-cost gate:            start 10k, warmup 90k
-difficulty prior:     start 35k, warmup 50k
-schedule mode:        prior_residual
-residual scale:       0.75 early, 0.30 after prior handoff
+steps range:             3 to 15
+fixed denoising teacher: 8
+chunk bounds:            1 to 4
+weak_chunk target:       chunk 4 -> 3.75
+both_explore target:     chunk 4 -> 3
+step_only target:        chunk fixed at 4
+NFE target:              1.70, about 15% below fixed 8/4 = 2.00
+NFE band:                1.55 to 1.90
+saving weight:           0.06
+cost lambda:             0.05 -> 0.45
+cost gate:               time ramp x success gate 0.65 -> 0.80, open rate 0.08
+failed episode cost:     0.15x over-budget penalty before success
+difficulty prior:        start 35k, warmup 50k
+difficulty loss:         elastic_margin_hinge with target-normalized allocation margin
+quantile hinge:          off by default
+SQUARE strong gate:      success gates 0.35 -> 0.55, range floor 0.50
 ```
 
 The full values are in:
 
 ```text
 cfg/robomimic/dsrl_can.yaml
-scripts/launch_budget_strong_chunk_ablation.sh
+scripts/run_step_chunk_ablation_v2.sh
+scripts/launch_step_difficulty_h20.sh
 ```
 
 ## Notes
